@@ -1,6 +1,6 @@
 // src/handlers/public/settings.ts
 
-import { Request, Env } from '../../types';
+import { Env } from '../../types';
 import { apiResponse, apiError } from '../../index'; // Assuming these are exported from index.ts
 
 // Helper function to check collection status (copied from App 1 Worker)

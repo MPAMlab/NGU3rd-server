@@ -1,6 +1,6 @@
 // src/handlers/live/state.ts
 
-import { Request, Env, LiveMatchState } from '../../types';
+import { Env, LiveMatchState } from '../../types';
 import { apiResponse, apiError } from '../../index'; // Assuming these are exported from index.ts
 
 // GET /api/live/state/:matchId (Public - No auth needed)
