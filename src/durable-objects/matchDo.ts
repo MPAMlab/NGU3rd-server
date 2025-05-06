@@ -42,16 +42,29 @@ export class MatchDO implements DurableObject {
   // Helper to broadcast updates to all connected WebSockets
   private broadcast(message: object | string) {
     const payload = typeof message === 'string' ? message : JSON.stringify(message);
+    // Filter out closed connections before broadcasting
+    this.websockets = this.websockets.filter(ws => ws.readyState === WebSocket.OPEN);
     this.websockets.forEach((ws) => {
       try {
         ws.send(payload);
       } catch (e) {
-        // Handle potential errors if a WebSocket connection is broken
         console.error('Error sending message to WebSocket:', e);
-        // Optionally remove broken WebSockets from the list
+        // Connection might have closed between filter and send, will be removed on next filter
       }
     });
   }
+
+  // Helper to determine winner based on scores
+  private determineWinner(state: { teamA_score: number; teamB_score: number; teamA_name: string; teamB_name: string }): string | null {
+      if (state.teamA_score > state.teamB_score) {
+          return state.teamA_name || '队伍A'; // Use default name if empty
+      } else if (state.teamB_score > state.teamA_score) {
+          return state.teamB_name || '队伍B'; // Use default name if empty
+      } else {
+          return null; // Draw or undecided
+      }
+  }
+
 
   // --- New Methods for Round/Match Management ---
 
@@ -65,11 +78,14 @@ export class MatchDO implements DurableObject {
         return { success: false, message: "Match is already archived, cannot archive rounds." };
     }
 
+    // Determine winner for this round's archive based on current scores
+    const winnerName = this.determineWinner(this.matchData);
+
     try {
       const stmt = this.env.DB.prepare(
         `INSERT INTO round_archives (match_do_id, round_number, team_a_name, team_a_score, team_a_player,
-                                     team_b_name, team_b_score, team_b_player, status, archived_at, raw_data)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     team_b_name, team_b_score, team_b_player, status, archived_at, raw_data, winner_team_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(match_do_id, round_number) DO UPDATE SET
             team_a_name = excluded.team_a_name,
             team_a_score = excluded.team_a_score,
@@ -79,7 +95,8 @@ export class MatchDO implements DurableObject {
             team_b_player = excluded.team_b_player,
             status = excluded.status,
             archived_at = excluded.archived_at,
-            raw_data = excluded.raw_data`
+            raw_data = excluded.raw_data,
+            winner_team_name = excluded.winner_team_name` // Update winner on conflict
       );
 
       const result = await stmt.bind(
@@ -93,7 +110,8 @@ export class MatchDO implements DurableObject {
         this.matchData.teamB_player,
         this.matchData.status, // Archive the status at the end of the round
         new Date().toISOString(),
-        JSON.stringify(this.matchData) // Store raw data
+        JSON.stringify(this.matchData), // Store raw data
+        winnerName // Bind the winner name
       ).run();
 
       if (result.success) {
@@ -118,17 +136,20 @@ export class MatchDO implements DurableObject {
      if (this.matchData.status === 'archived_in_d1') {
         return { success: false, message: "Match is already archived, cannot advance round." };
     }
-     if (this.matchData.status === 'finished') {
-        return { success: false, message: "Match is finished, cannot advance round. Archive match first." };
-    }
+     // Optional: Prevent advancing if status is 'finished' - depends on workflow
+     // if (this.matchData.status === 'finished') {
+     //    return { success: false, message: "Match is finished, cannot advance round. Archive match first." };
+     // }
 
 
     // Optional: Automatically archive the current round before advancing
-    // const archiveResult = await this.archiveCurrentRound();
-    // if (!archiveResult.success) {
-    //     console.warn("Failed to auto-archive current round before advancing:", archiveResult.message);
-    //     // Decide if you want to stop here or proceed anyway
-    // }
+    // This ensures the state *before* scores are reset is saved
+    const archiveResult = await this.archiveCurrentRound();
+    if (!archiveResult.success) {
+        console.warn("Failed to auto-archive current round before advancing:", archiveResult.message);
+        // Decide if you want to stop here or proceed anyway
+        // return { success: false, message: "Failed to auto-archive current round before advancing." };
+    }
 
     this.matchData.round += 1;
     this.matchData.teamA_score = 0; // Reset scores for the new round
@@ -155,19 +176,15 @@ export class MatchDO implements DurableObject {
         return { success: true, message: "Match already archived.", d1RecordId: this.matchData.matchId };
     }
 
-    // Optional: Ensure the final round is archived before archiving the match
-    // const roundArchiveResult = await this.archiveCurrentRound();
-    // if (!roundArchiveResult.success) {
-    //      console.warn("Failed to auto-archive final round before archiving match:", roundArchiveResult.message);
-    //      // Decide if you want to stop here or proceed anyway
-    // }
+    // Determine winner for the entire match archive (based on final score)
+    const matchWinnerName = this.determineWinner(this.matchData);
 
 
     try {
       const stmt = this.env.DB.prepare(
         `INSERT INTO matches_archive (match_do_id, final_round, team_a_name, team_a_score, team_a_player,
-                                     team_b_name, team_b_score, team_b_player, status, archived_at, raw_data)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     team_b_name, team_b_score, team_b_player, status, archived_at, raw_data, winner_team_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(match_do_id) DO UPDATE SET
             final_round = excluded.final_round,
             team_a_name = excluded.team_a_name,
@@ -178,10 +195,10 @@ export class MatchDO implements DurableObject {
             team_b_player = excluded.team_b_player,
             status = excluded.status,
             archived_at = excluded.archived_at,
-            raw_data = excluded.raw_data`
+            raw_data = excluded.raw_data,
+            winner_team_name = excluded.winner_team_name` // Update winner on conflict
       );
 
-      // Use the current state as the final state for the match archive
       const finalMatchState = { ...this.matchData };
       // Ensure status is marked as finished or archived in the D1 record
       const finalStatusForArchive = finalMatchState.status === 'pending' || finalMatchState.status === 'live' || finalMatchState.status === 'paused'
@@ -200,7 +217,8 @@ export class MatchDO implements DurableObject {
         finalMatchState.teamB_player,
         finalStatusForArchive, // Use the determined final status for the D1 record
         new Date().toISOString(),
-        JSON.stringify(finalMatchState) // Store raw data as well
+        JSON.stringify(finalMatchState), // Store raw data as well
+        matchWinnerName // Bind the match winner name
       ).run();
 
       if (result.success) {
@@ -261,21 +279,23 @@ export class MatchDO implements DurableObject {
     const url = new URL(request.url);
 
     // Ensure matchData is loaded (it should be by the constructor's blockConcurrencyWhile)
+    // This check is a safeguard, constructor should handle initial load
     if (!this.matchData) {
-        // This should ideally not happen if constructor logic is correct
-        await this.state.blockConcurrencyWhile(async () => {
+         console.warn(`DO (${this.matchId}): matchData not loaded before fetch. Attempting load.`);
+         await this.state.blockConcurrencyWhile(async () => {
             const storedMatchData = await this.state.storage.get<MatchState>('matchData');
             if (storedMatchData) this.matchData = storedMatchData;
             else this.matchData = { ...defaultMatchState, matchId: this.matchId }; // Fallback
         });
         if (!this.matchData) { // Still null, critical error
+             console.error(`DO (${this.matchId}): Failed to initialize matchData.`);
              return new Response(JSON.stringify({ error: "Match data not initialized in DO" }), { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
     }
 
 
     // WebSocket upgrade
-    if (url.pathname === '/api/match/websocket') { // Match the path used in worker
+    if (url.pathname === '/websocket') { // Internal path for WS
       if (request.headers.get('Upgrade') !== 'websocket') {
         return new Response('Expected Upgrade: websocket', { status: 426 });
       }
@@ -288,14 +308,15 @@ export class MatchDO implements DurableObject {
       }
       // Handle messages from this specific client (optional, e.g., for pings)
       server.addEventListener('message', event => {
-        console.log('WS message from client:', event.data);
+        console.log(`DO (${this.matchId}) WS message from client:`, event.data);
         // server.send(`Echo: ${event.data}`);
       });
       server.addEventListener('close', () => {
+        console.log(`DO (${this.matchId}) WebSocket closed.`);
         this.websockets = this.websockets.filter(ws => ws !== server);
       });
       server.addEventListener('error', (err) => {
-        console.error('WebSocket error:', err);
+        console.error(`DO (${this.matchId}) WebSocket error:`, err);
         this.websockets = this.websockets.filter(ws => ws !== server);
       });
       return new Response(null, { status: 101, webSocket: client });
@@ -332,12 +353,13 @@ export class MatchDO implements DurableObject {
         return new Response(JSON.stringify({ success: true, data: this.matchData }), {
           headers: { 'Content-Type': 'application/json' },
         });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'Invalid update payload' }), { status: 400 });
+      } catch (e: any) {
+        console.error(`DO (${this.matchId}) Error processing update payload:`, e);
+        return new Response(JSON.stringify({ error: 'Invalid update payload', details: e.message }), { status: 400 });
       }
     }
 
-    // --- New Internal Endpoints ---
+    // --- Internal Endpoints for Actions ---
 
     // Internal endpoint to archive current round data to D1
     if (url.pathname === '/internal/archive-round' && request.method === 'POST') {
@@ -351,15 +373,7 @@ export class MatchDO implements DurableObject {
 
     // Internal endpoint to advance to the next round
     if (url.pathname === '/internal/next-round' && request.method === 'POST') {
-       // Optional: Auto-archive current round before advancing
-       const archiveResult = await this.archiveCurrentRound();
-       if (!archiveResult.success) {
-           console.warn("Auto-archiving current round failed before advancing:", archiveResult.message);
-           // Decide if you want to return an error or proceed anyway
-           // return new Response(JSON.stringify({ success: false, message: "Failed to auto-archive current round before advancing." }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-       }
-
-      const nextRoundResult = await this.nextRound();
+       const nextRoundResult = await this.nextRound();
        if (nextRoundResult.success) {
            return new Response(JSON.stringify(nextRoundResult), { headers: { 'Content-Type': 'application/json' } });
        } else {
