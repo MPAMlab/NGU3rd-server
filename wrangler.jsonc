@@ -1,71 +1,44 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
- {
+{
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "applyform", // Or change this back to "l1nker-server" if that's the correct name
+	"name": "ngu3rd-worker",
 	"main": "src/index.ts",
-	"compatibility_date": "2025-04-25", // Consider updating this to match your TOML example's date if needed, or keep it current
-	// "compatibility_flags": ["nodejs_compat"], // Add this if you need Node.js compatibility, matching your TOML
-
+	"compatibility_date": "2024-04-25", // Your date, ensure it's recent enough for DO features
+	// "compatibility_flags": ["nodejs_compat"], // If needed
+  
 	"observability": {
-		"enabled": true
+	  "enabled": true
 	},
-	/**
-	 * Smart Placement
-	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	// "placement": { "mode": "smart" },
-
-	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
-	 */
-
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 */
-	/**
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
-
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": { "directory": "./public/", "binding": "ASSETS" },
-
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
+  
+	// Add or ensure this section exists and is correct
+	"durable_objects": {
+	  "bindings": [
+		{ "name": "MATCH_DO", "class_name": "MatchDO" }
+	  ]
+	},
+	// This migration is needed when you first introduce a new DO class
+	// or change its class_name. Wrangler might prompt you or handle it.
+	// If deploying for the first time with this DO, include a migration.
+	"migrations": [
+     // 将 "new_classes" 修改为 "new_sqlite_classes"
+     { "tag": "v1-init-match-do-sqlite", "new_sqlite_classes": ["MatchDO"] }
+     // 如果你有其他旧的 migration，可以注释掉或删除，或者确保它们也适用
+  ],
+  
 	"d1_databases": [
-		{
+	  {
 		"binding": "DB",
 		"database_name": "ngu3rd_signup",
 		"database_id": "7b956247-6532-467e-9e63-48e5bb16f360"
-		}
-	], // <-- Add a comma here if 'routes' is not the last property
-	"r2_buckets": [
-		{
-		"binding": "AVATAR_BUCKET",
-		"bucket_name": "ngusignup",
-		}
+	  }
 	],
-	/**
-	 * Routes
-	 * Define patterns to trigger this Worker.
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#routes
-	 */
+	"r2_buckets": [
+	  {
+		"binding": "AVATAR_BUCKET",
+		"bucket_name": "ngusignup"
+	  }
+	],
 	"routes": [
-		{ "pattern": "ngu3rd.mpam-lab.xyz/api/*", "zone_name": "mpam-lab.xyz" }
-		// You can add more route objects here, separated by commas:
-		// { "pattern": "another-pattern.example.com/*", "zone_id": "YOUR_ZONE_ID" }
+	  { "pattern": "ngu3rd.mpam-lab.xyz/api/*", "zone_name": "mpam-lab.xyz" }
 	]
-	// If you add more top-level properties after 'routes', add a comma after the closing bracket ']'
-}
+  }
+  
