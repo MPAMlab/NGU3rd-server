@@ -16,18 +16,11 @@ import type {
     MatchScheduleData // Import the new type
 } from './types'; // Import all necessary types
 
-// Helper function to get the singleton MatchDO ID (Used for unscheduled matches)
-// Note: Scheduled matches will use a DO ID derived from their tournamentMatchId
-function getSingletonMatchId(env: Env): DurableObjectId {
-  // Using a fixed name for the *current* live match DO instance (for unscheduled flow)
-  return env.MATCH_DO.idFromName("singleton-match-instance");
-}
-
-// Helper to determine winner based on scores (duplicated from DO for D1 updates)
+// Helper function to determine winner based on scores (duplicated from DO for D1 updates)
 function determineWinner(state: { team_a_score: number; team_b_score: number; team_a_name: string; team_b_name: string }): string | null {
     if (state.team_a_score > state.team_b_score) {
         return state.team_a_name || '队伍A';
-    } else if (state.team_b_score > state.team_a_score) { // FIX: Corrected comparison here
+    } else if (state.team_b_score > state.team_a_score) { // Corrected comparison
         return state.team_b_name || '队伍B';
     } else {
         return null; // Draw or undecided
@@ -45,43 +38,9 @@ function parsePlayerOrder(orderString: string | null | undefined): number[] {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    // Note: matchStub here refers to the *singleton* DO, used for unscheduled matches.
-    // Scheduled matches will get their stub based on tournamentMatchId.
-    const singletonMatchId = getSingletonMatchId(env);
-    const singletonMatchStub = env.MATCH_DO.get(singletonMatchId);
-
-
-    // --- Route requests to the Durable Object (Singleton Instance) ---
-    // These endpoints are for the *current* unscheduled live match managed by the singleton DO
-
-    // WebSocket requests are forwarded to the DO
-    if (url.pathname === '/api/match/websocket') {
-      return singletonMatchStub.fetch(new Request(url.origin + "/websocket", request));
-    }
-
-    // Forward specific API calls related to the *current* match state to the DO's internal endpoints
-    if (url.pathname === '/api/match/state' && request.method === 'GET') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/state", request));
-    }
-    if (url.pathname === '/api/match/update' && request.method === 'POST') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/update", request));
-    }
-    if (url.pathname === '/api/match/archive-round' && request.method === 'POST') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/internal/archive-round", request));
-    }
-    if (url.pathname === '/api/match/next-round' && request.method === 'POST') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/internal/next-round", request));
-    }
-    if (url.pathname === '/api/match/archive-match' && request.method === 'POST') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/internal/archive-match", request));
-    }
-     // This is the old 'new match' endpoint, now for unscheduled matches
-     if (url.pathname === '/api/match/new-match' && request.method === 'POST') {
-        return singletonMatchStub.fetch(new Request(url.origin + "/internal/new-match", request));
-    }
-
 
     // --- Handle D1 Queries/Updates directly in the Worker ---
+    // (Keep all your existing D1 management endpoints like /api/teams, /api/members, /api/tournament_matches, /api/archived_rounds, /api/archived_matches)
 
     // --- Teams Management Endpoints ---
     if (url.pathname === '/api/teams') {
@@ -299,9 +258,6 @@ export default {
 
 
     // --- Members Management Endpoints ---
-    // Add endpoints for /api/members and /api/members/:id (GET, POST, PUT, DELETE)
-    // Add endpoint for /api/teams/:team_code/members (GET)
-
     if (url.pathname === '/api/members') {
         if (request.method === 'POST') {
             // Create Member
@@ -662,7 +618,6 @@ export default {
                      LEFT JOIN teams tw ON tm.winner_team_id = tw.id
                      WHERE tm.id = ?
                  `);
-                 // FIX: Added .bind() here
                  const { results } = await stmt.bind(tournamentMatchId).all<TournamentMatch>();
 
                  if (results && results.length > 0) {
@@ -809,7 +764,6 @@ export default {
                     JOIN teams t2 ON tm.team2_id = t2.id
                     WHERE tm.id = ?
                 `);
-                // FIX: Added .bind() here
                 const { results } = await matchStmt.bind(tournamentMatchId).all<TournamentMatch>();
 
                 if (!results || results.length === 0) {
@@ -885,13 +839,13 @@ export default {
                 };
 
                 // 4. Get or create Durable Object instance for THIS scheduled match
-                // FIX: Use tournamentMatchId to derive the DO ID
+                // Use tournamentMatchId to derive the DO ID
                 const matchDOId = env.MATCH_DO.idFromName(tournamentMatchId.toString());
                 const matchStub = env.MATCH_DO.get(matchDOId);
 
 
                 // Call the DO's internal initialization endpoint
-                const initResponse = await matchStub.fetch(new Request(url.origin + "/internal/initialize-from-schedule", {
+                const initResponse = await matchStub.fetch(new Request(url.origin + `/internal/initialize-from-schedule`, { // Use internal path
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(scheduleDataForDO),
@@ -906,7 +860,7 @@ export default {
 
                 // 5. Update the tournament_matches entry in D1
                 const updateStmt = env.DB.prepare("UPDATE tournament_matches SET status = ?, match_do_id = ? WHERE id = ?");
-                // FIX: Use the newly created matchDOId.toString()
+                // Use the newly created matchDOId.toString()
                 const updateResult = await updateStmt.bind('live', matchDOId.toString(), tournamentMatchId).run();
 
                 if (!updateResult.success) {
@@ -918,7 +872,7 @@ export default {
                      console.log(`Worker updated tournament_matches entry ${tournamentMatchId} status to 'live' and linked DO ID.`);
                 }
 
-                // FIX: Return the newly created matchDOId
+                // Return the newly created matchDOId
                 return new Response(JSON.stringify({ success: true, message: "Live match started from schedule.", matchDOId: matchDOId.toString(), tournamentMatchId: tournamentMatch.id }), { headers: { 'Content-Type': 'application/json' } });
 
             } catch (e: any) {
@@ -1034,6 +988,7 @@ export default {
 
     // Endpoint to get archived round data from D1 for a specific match DO ID
     // This endpoint is used by the frontend to display archived rounds for a finished match
+    // Modified to use the path parameter as the match_do_id
     if (url.pathname.startsWith('/api/archived_rounds/') && request.method === 'GET') {
         const pathParts = url.pathname.split('/');
         // Expecting /api/archived_rounds/{match_do_id}
@@ -1048,7 +1003,9 @@ export default {
             const stmt = env.DB.prepare("SELECT * FROM round_archives WHERE match_do_id = ? ORDER BY round_number ASC");
             const { results } = await stmt.bind(matchDOId).all<RoundArchive>();
 
-            return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
+            // If no results, return 404 or empty array? Let's return empty array for consistency with list endpoints
+            return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
+
         } catch (e: any) {
             console.error("Worker D1 round query error:", e.stack); // Use e.stack
             return new Response(JSON.stringify({ error: "Failed to retrieve archived rounds", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
@@ -1057,6 +1014,7 @@ export default {
 
     // Endpoint to update an archived round in D1
     // This request does NOT go to the DO, it interacts with D1 directly from the worker
+    // This endpoint uses the D1 *record ID* of the round archive, not the match DO ID
     if (url.pathname.startsWith('/api/archived_rounds/') && request.method === 'PUT') {
         const pathParts = url.pathname.split('/');
         const roundArchiveId = parseInt(pathParts[pathParts.length - 1], 10); // Get ID from path
@@ -1169,8 +1127,73 @@ export default {
     }
 
 
+    // --- NEW Durable Object Endpoints for Scheduled Matches ---
+    // These endpoints will take the matchDOId from the path
+
+    // Helper to get DO stub from path
+    const getMatchStubFromPath = (pathname: string, env: Env): { stub: DurableObjectStub, doId: string } | null => {
+        const pathParts = pathname.split('/');
+        // Expected format: /api/live-match/{matchDOId}/...
+        if (pathParts.length >= 4 && pathParts[1] === 'api' && pathParts[2] === 'live-match') {
+            const matchDOId = pathParts[3];
+            if (matchDOId) {
+                 try {
+                    // Use idFromString to get the ID object, then get the stub
+                    const doId = env.MATCH_DO.idFromString(matchDOId);
+                    return { stub: env.MATCH_DO.get(doId), doId: matchDOId };
+                 } catch (e) {
+                     console.error("Invalid matchDOId format:", e);
+                     return null; // Invalid ID format
+                 }
+            }
+        }
+        return null; // Path format doesn't match
+    };
+
+    const matchStubInfo = getMatchStubFromPath(url.pathname, env);
+
+    if (matchStubInfo) {
+        const matchStub = matchStubInfo.stub;
+        const matchDOId = matchStubInfo.doId; // Get the string ID
+        // Reconstruct the path for the DO, removing the /api/live-match/{matchDOId} prefix
+        const doPath = '/' + url.pathname.split('/').slice(4).join('/'); // e.g., /state, /websocket, /internal/update
+
+        // Route requests to the specific Durable Object instance
+        if (doPath === '/websocket' && request.method === 'GET') {
+            // WebSocket requests are forwarded to the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+        if (doPath === '/state' && request.method === 'GET') {
+            // Get state from the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+        if (doPath === '/update' && request.method === 'POST') {
+            // Update state in the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+        if (doPath === '/internal/archive-round' && request.method === 'POST') {
+            // Archive round in the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+        if (doPath === '/internal/next-round' && request.method === 'POST') {
+            // Advance to next round in the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+        if (doPath === '/internal/archive-match' && request.method === 'POST') {
+            // Archive match in the specific DO
+            return matchStub.fetch(new Request(url.origin + doPath, request));
+        }
+         // Note: /internal/initialize-from-schedule is called by the worker itself, not exposed directly here.
+         // The old /internal/new-match (for singleton) is not handled here either.
+
+         // If a matchStub was found but the doPath didn't match any known DO endpoint
+         return new Response(JSON.stringify({ error: `Live match endpoint not found for DO ID ${matchDOId} at path ${doPath}` }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    }
+
+
     // Fallback for other requests or static assets (if any served by this worker)
-    return new Response('Not found. API endpoints are /api/match/* (singleton DO), /api/teams, /api/teams/:id, /api/teams/bulk, /api/members, /api/members/:id, /api/teams/:team_code/members, /api/members/bulk, /api/tournament_matches, /api/tournament_matches/:id, /api/tournament_matches/bulk, /api/tournament_matches/:id/start_live, /api/archived_rounds/{match_do_id}, /api/archived_rounds/:id (PUT), /api/archived_matches, /api/archived_matches/{match_do_id}', { status: 404 });
+    // This will also catch the old /api/match/* routes if they are not explicitly handled above
+    return new Response('Not found. API endpoints are /api/teams, /api/teams/:id, /api/teams/bulk, /api/members, /api/members/:id, /api/teams/:team_code/members, /api/members/bulk, /api/tournament_matches, /api/tournament_matches/:id, /api/tournament_matches/bulk, /api/tournament_matches/:id/start_live, /api/archived_rounds/{match_do_id} (GET), /api/archived_rounds/:id (PUT), /api/archived_matches (GET), /api/archived_matches/{match_do_id} (GET), /api/live-match/{matchDOId}/websocket, /api/live-match/{matchDOId}/state, /api/live-match/{matchDOId}/update, /api/live-match/{matchDOId}/internal/archive-round, /api/live-match/{matchDOId}/internal/next-round, /api/live-match/{matchDOId}/internal/archive-match', { status: 404 });
   },
 };
 
