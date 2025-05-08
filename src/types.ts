@@ -7,7 +7,7 @@ export interface Env {
     AVATAR_BUCKET: R2Bucket;
     // Add any other bindings or environment variables here
   }
-  
+
   // Represents a Team (matching your existing table structure)
   export interface Team {
       id: number; // D1 auto-increment ID
@@ -18,13 +18,13 @@ export interface Env {
       has_revive_mirror?: number | null; // 0 or 1
       status?: string | null; // e.g., 'active', 'inactive'
   }
-  
+
   // Represents a Member (matching your existing table structure)
   export interface Member {
       id: number; // D1 auto-increment ID
       team_code: string; // FK to teams.code
       color?: string | null;
-      job?: string | null;
+      job?: string | null; // e.g., "绝剑士", "矩盾手", "炼星师"
       maimai_id?: string | null;
       nickname: string; // The player name to display
       qq_number?: string | null;
@@ -38,8 +38,8 @@ export interface Env {
       // or map nickname to name when creating DO state.
       // For now, assuming nickname is used as player name.
   }
-  
-  
+
+
   // Represents a scheduled Tournament Match (linking to your teams.id)
   export interface TournamentMatch {
       id: number;
@@ -54,7 +54,7 @@ export interface Env {
       winner_team_id?: number | null; // NULLABLE, FK to teams.id (比赛结束后填写)
       scheduled_time?: string | null; // Optional: ISO 8601 string preferred
       created_at: string; // ISO 8601 timestamp
-  
+
       // Fields added by JOIN in the query (used in worker responses)
       team1_code?: string;
       team1_name?: string;
@@ -63,7 +63,7 @@ export interface Env {
       winner_team_code?: string;
       winner_team_name?: string;
   }
-  
+
   // --- New Type for Tournament Match Form Data / Create Payload ---
   // This type allows team_id to be null for form state before submission
   export interface CreateTournamentMatchPayload {
@@ -76,14 +76,14 @@ export interface Env {
       scheduled_time?: string | null;
       // Note: status, match_do_id, winner_team_id, created_at are not part of the creation payload
   }
-  
-  
+
+
   // Represents the real-time state stored in the Durable Object
   // This type is primarily used within the DO and when passing data to initialize it
   export interface MatchState {
     matchId: string; // The ID of the Durable Object instance (should match tournamentMatchId.toString())
     tournamentMatchId?: number | null; // Added: Link back to the scheduled match
-  
+
     round: number;
     teamA_name: string;
     teamA_score: number;
@@ -91,7 +91,7 @@ export interface Env {
     teamB_name: string;
     teamB_score: number;
     teamB_player: string; // Current player nickname
-  
+
     // Store full member objects and the order of their IDs
     teamA_members: Member[]; // Array of Member objects for Team A
     teamB_members: Member[]; // Array of Member objects for Team B
@@ -99,10 +99,17 @@ export interface Env {
     teamB_player_order_ids: number[]; // Array of member.id in the desired playing order
     current_player_index_a: number; // Index in teamA_player_order_ids for current player
     current_player_index_b: number; // Index in teamB_player_order_ids for current player
-  
-    status: 'pending' | 'live' | 'finished' | 'paused' | 'archived_in_d1';
+
+    // New fields for game logic
+    teamA_mirror_available: boolean;
+    teamB_mirror_available: boolean;
+    teamA_current_player_profession: 'attacker' | 'defender' | 'supporter' | null;
+    teamB_current_player_profession: 'attacker' | 'defender' | 'supporter' | null;
+
+
+    status: 'pending' | 'round_finished' | 'team_A_wins' | 'team_B_wins' | 'draw_pending_resolution' | 'archived_in_d1';
   }
-  
+
   // Type for a single archived round record stored in D1
   export interface RoundArchive {
       id: number; // D1 auto-increment ID
@@ -120,8 +127,8 @@ export interface Env {
       winner_team_name?: string; // Added winner field
       // is_editable?: number; // If you add this field
   }
-  
-  
+
+
   // Type for a single archived match summary record stored in D1
   export interface MatchArchiveSummary {
     id: number; // D1 auto-increment ID
@@ -135,14 +142,14 @@ export interface Env {
     team_b_name?: string;
     team_b_score?: number;
     team_b_player?: string;
-    status: string; // Final status (should be 'finished' or 'archived_in_d1' in D1)
+    status: string; // Final status (should be 'completed' or 'archived_in_d1' in D1)
     archived_at: string; // ISO date string
     raw_data?: string; // Optional: store raw JSON of the final state
     winner_team_name?: string; // Added winner field for the whole match
   }
-  
+
   // --- Types for Bulk Import ---
-  
+
   // Expected structure for a row in the Team Bulk Import CSV
   export interface BulkTeamRow {
       code: string;
@@ -152,7 +159,7 @@ export interface Env {
       // has_revive_mirror?: string;
       // status?: string;
   }
-  
+
   // Expected structure for a row in the Member Bulk Import CSV
   export interface BulkMemberRow {
       team_code: string;
@@ -165,7 +172,7 @@ export interface Env {
       kinde_user_id?: string;
       is_admin?: string; // CSV is string, need parsing to number/boolean
   }
-  
+
   // Expected structure for a row in the Tournament Match Bulk Import CSV
   // Similar to CreateTournamentMatchPayload, but values come as strings from CSV parsing
   export interface BulkTournamentMatchRow {
@@ -177,7 +184,7 @@ export interface Env {
       team2_player_order?: string; // Comes as string from CSV
       scheduled_time?: string; // Comes as string from CSV
   }
-  
+
   // --- Type for data passed to DO initialization from schedule ---
   // This is the structure sent in the body of the POST to /internal/initialize-from-schedule
   export interface MatchScheduleData {
@@ -192,4 +199,17 @@ export interface Env {
       round_name?: string; // Added
       match_number_in_round?: number; // Added
   }
-  
+
+  // Payload for calculating a round
+  export interface CalculateRoundPayload {
+      teamA_percentage: number;
+      teamB_percentage: number;
+  }
+
+  // Payload for resolving a draw
+  export interface ResolveDrawPayload {
+      winner: 'teamA' | 'teamB';
+  }
+
+  // Internal profession type used in DO logic
+  export type InternalProfession = 'attacker' | 'defender' | 'supporter' | null;
