@@ -1,961 +1,819 @@
 // src/index.ts
-
-import { MatchDO } from './durable-objects/matchDo';
 import type {
     Env,
-    RoundArchive,
-    MatchArchiveSummary,
-    Team,
-    Member,
-    TournamentMatch,
-    CreateTournamentMatchPayload,
-    BulkTeamRow,
-    BulkMemberRow,
-    BulkTournamentMatchRow,
-    MatchState, // Import MatchState if needed in worker (e.g., for type assertions)
-    MatchScheduleData // Import the new type
-} from './types'; // Import all necessary types
+    Team, // Keep Team type
+    Member, // Keep Member type
+    TournamentMatch, // Updated TournamentMatch type
+    CreateTournamentMatchPayload, // Keep CreateTournamentMatchPayload
+    MatchState, // Updated MatchState type
+    CalculateRoundPayload, // Updated CalculateRoundPayload
+    ResolveDrawPayload, // Keep ResolveDrawPayload
+    MatchScheduleData, // Updated MatchScheduleData
+    MemberSongPreference, // New MemberSongPreference type
+    Song, // New Song type
+    SongFromR2, // New SongFromR2 type
+    R2SongList, // New R2SongList type
+    MatchSong, // New MatchSong type
+    SelectTiebreakerSongPayload, // New SelectTiebreakerSongPayload
+    RoundSummary // New RoundSummary type
+} from './types';
+import { MatchDO } from './durable-objects/matchDo'; // Import the DO class
 
-// IMPORTANT: Export the Durable Object class from the entrypoint
-// This allows the Worker runtime to find and instantiate the DO.
-export { MatchDO };
+// Helper to get a DO instance by ID string
+const getMatchDO = (doIdString: string, env: Env): DurableObjectStub => {
+    const id = env.MATCH_DO.idFromString(doIdString);
+    return env.MATCH_DO.get(id);
+};
 
+// Helper to handle forwarding requests to DOs
+const forwardRequestToDO = async (doIdString: string, env: Env, request: Request, internalPath: string, method: string = 'POST', body?: any): Promise<Response> => {
+    try {
+        const doStub = getMatchDO(doIdString, env);
+        // Use a dummy URL with the correct origin/protocol for the DO fetch
+        // The actual path is set in internalPath
+        const doUrl = new URL(`https://${request.headers.get('Host') || 'dummy-host'}`);
+        doUrl.pathname = internalPath;
 
-// Helper function to determine winner based on scores (duplicated from DO for D1 updates)
-function determineWinner(state: { team_a_score: number; team_b_score: number; team_a_name: string; team_b_name: string }): string | null {
-    if (state.team_a_score > state.team_b_score) {
-        return state.team_a_name || '队伍A';
-    } else if (state.team_b_score > state.team_a_score) { // Corrected comparison
-        return state.team_b_name || '队伍B';
-    } else {
-        return null; // Draw or undecided
+        const doRequest = new Request(doUrl.toString(), {
+            method: method,
+            headers: request.headers, // Keep original headers like Authorization, Content-Type
+            body: body ? JSON.stringify(body) : request.body, // Stringify body if provided
+            redirect: 'follow',
+        });
+
+        // Remove headers that might cause issues or are irrelevant for internal DO fetch
+        doRequest.headers.delete('Host'); // Cloudflare handles Host for DOs
+        // doRequest.headers.delete('Origin'); // Usually not needed for internal paths
+
+        const response = await doStub.fetch(doRequest);
+        return response;
+
+    } catch (e: any) {
+        console.error(`Worker: Failed to forward request to DO ${doIdString} for path ${internalPath}:`, e);
+        // Return a structured error response
+        return new Response(JSON.stringify({ success: false, error: `Failed to communicate with match instance: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
-}
+};
 
-// Helper to parse player order string (e.g., '1,2,3') into an array of 1-based numbers
-function parsePlayerOrder(orderString: string | null | undefined): number[] {
-    if (!orderString) return [];
-    // Filter for valid numbers 1-3 (assuming 3 players per team)
-    return orderString.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n >= 1 && n <= 3);
-}
+// Helper to wrap responses in ApiResponse format
+const jsonResponse = <T>(data: T, status: number = 200): Response => {
+    return new Response(JSON.stringify({ success: true, data }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+    });
+};
+
+const errorResponse = (error: string, status: number = 500): Response => {
+    return new Response(JSON.stringify({ success: false, error }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+    });
+};
 
 
+// --- Worker Entry Point ---
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        const url = new URL(request.url);
+        const method = request.method;
+        const pathname = url.pathname;
 
-    // All API routes start with /api/
-    if (url.pathname.startsWith('/api/')) {
+        // Apply CORS headers to all responses (adjust as needed for your frontend origin)
+        const corsHeaders = {
+            'Access-Control-Allow-Origin': '*', // Replace with your frontend origin in production
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        };
 
-        // --- Handle WebSocket connections to a specific Live Match DO ---
-        // Path: /api/live-match/{doIdString}/websocket
-        if (url.pathname.startsWith('/api/live-match/') && url.pathname.endsWith('/websocket')) {
-            const pathParts = url.pathname.split('/'); // Expected: ['', 'api', 'live-match', 'DO_ID_STRING', 'websocket']
-            if (pathParts.length !== 5) {
-                return new Response(JSON.stringify({ error: 'Invalid WebSocket path structure for live match.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-            }
-            const matchDOIdString = pathParts[3]; // Extract the DO ID string from the URL
-
-            if (!matchDOIdString) {
-                return new Response(JSON.stringify({ error: 'Match Durable Object ID string missing in path.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-            }
-
-            // Check if the request is a WebSocket upgrade request
-            const upgradeHeader = request.headers.get('Upgrade');
-            if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-                return new Response('Expected Upgrade: websocket', { status: 426 });
-            }
-
-            try {
-                // Get the Durable Object ID from the string.
-                // THIS IS WHERE THE ERROR "Invalid Durable Object ID" OCCURS
-                // if matchDOIdString was generated by a different DO class definition.
-                const durableObjectId = env.MATCH_DO.idFromString(matchDOIdString);
-
-                // Get the Durable Object stub
-                const stub = env.MATCH_DO.get(durableObjectId);
-
-                // Forward the WebSocket request to the Durable Object instance.
-                // We need to create a new Request object with the internal path
-                // that the DO's fetch handler expects for WebSocket connections ('/websocket').
-                // The original request's headers (including 'Upgrade') and method are passed.
-                const doRequest = new Request(`https://internal-do-host/websocket`, request); // The host is arbitrary for DO internal requests
-
-                console.log(`Worker: Forwarding WebSocket request for DO ID ${matchDOIdString} to DO stub.`);
-                return stub.fetch(doRequest); // Forward the request to the DO
-
-            } catch (err: any) {
-                console.error(`Worker: Error getting Durable Object stub for WebSocket connection. ID String: "${matchDOIdString}". Error: ${err.message}`, err.stack);
-                // Return an informative error response to the client
-                return new Response(JSON.stringify({
-                    error: "Failed to connect to live match WebSocket.",
-                    details: `Invalid Durable Object ID format or class mismatch for ID: ${matchDOIdString}. Please ensure the match is live and you are using the correct ID. Error: ${err.message}`
-                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-            }
+        // Handle CORS preflight requests
+        if (method === 'OPTIONS') {
+            return new Response(null, {
+                headers: corsHeaders,
+            });
         }
 
-        // --- Handle GET request for Live Match State from DO ---
-        // Path: /api/live-match/{doIdString}/state
-        if (url.pathname.startsWith('/api/live-match/') && url.pathname.endsWith('/state') && request.method === 'GET') {
-             const pathParts = url.pathname.split('/'); // Expected: ['', 'api', 'live-match', 'DO_ID_STRING', 'state']
-             if (pathParts.length !== 5) {
-                 return new Response(JSON.stringify({ error: 'Invalid state path structure for live match.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-             const matchDOIdString = pathParts[3]; // Extract the DO ID string
+        let response: Response;
 
-             if (!matchDOIdString) {
-                 return new Response(JSON.stringify({ error: 'Match Durable Object ID string missing in path.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
+        // --- API Endpoints (handled by Worker) ---
 
-             try {
-                 const durableObjectId = env.MATCH_DO.idFromString(matchDOIdString);
-                 const stub = env.MATCH_DO.get(durableObjectId);
-
-                 // Fetch the state from the DO's internal /state endpoint
-                 const doResponse = await stub.fetch(new Request(`https://internal-do-host/state`, { method: 'GET' }));
-
-                 // Return the response received from the DO
-                 return doResponse;
-
-             } catch (err: any) {
-                 console.error(`Worker: Error getting Durable Object state. ID String: "${matchDOIdString}". Error: ${err.message}`, err.stack);
-                 return new Response(JSON.stringify({
-                     error: "Failed to retrieve live match state.",
-                     details: `Error accessing Durable Object for ID: ${matchDOIdString}. Message: ${err.message}`
-                 }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-             }
-        }
-
-
-        // --- Handle D1 Queries/Updates directly in the Worker ---
-        // (Keep all your existing D1 management endpoints like /api/teams, /api/members, /api/tournament_matches, /api/archived_rounds, /api/archived_matches)
-
-        // --- Teams Management Endpoints ---
-        if (url.pathname === '/api/teams') {
-            if (request.method === 'POST') {
-                // Create Team
-                try {
-                    const teamData = await request.json<Omit<Team, 'id' | 'created_at' | 'current_health' | 'has_revive_mirror' | 'status'>>();
-                     if (!teamData.code || teamData.code.length !== 4 || !teamData.name) {
-                         return new Response(JSON.stringify({ error: "Team code (4 chars) and name are required." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     // Check if code already exists
-                     const existingTeam = await env.DB.prepare("SELECT id FROM teams WHERE code = ?").bind(teamData.code).first();
-                     if (existingTeam) {
-                          return new Response(JSON.stringify({ error: `Team code '${teamData.code}' already exists.` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-
-                    const stmt = env.DB.prepare("INSERT INTO teams (code, name, created_at, current_health, has_revive_mirror, status) VALUES (?, ?, ?, ?, ?, ?)");
-                    const result = await stmt.bind(
-                        teamData.code,
-                        teamData.name,
-                        Math.floor(Date.now() / 1000), // Use integer timestamp
-                        100, // Default current_health
-                        1, // Default has_revive_mirror
-                        'active' // Default status
-                    ).run();
-
-                    if (result.success) {
-                        // Fetch the newly created team to return it with its ID
-                        const newTeam = await env.DB.prepare("SELECT * FROM teams WHERE id = ?").bind(result.meta.last_row_id).first<Team>();
-                        return new Response(JSON.stringify({ success: true, message: "Team created.", team: newTeam }), { status: 201, headers: { 'Content-Type': 'application/json' } });
-                    } else {
-                        console.error("D1 create team error:", result.error);
-                        return new Response(JSON.stringify({ error: "Failed to create team", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                    }
-                } catch (e: any) {
-                    console.error("Worker exception during create team:", e.stack); // Use e.stack for better debugging
-                    return new Response(JSON.stringify({ error: `Exception creating team: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                }
-            } else if (request.method === 'GET') {
-                // Get All Teams
-                try {
-                    const { results } = await env.DB.prepare("SELECT * FROM teams ORDER BY code ASC").all<Team>();
-                    return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
-                } catch (e: any) {
-                    console.error("D1 get teams error:", e.stack); // Use e.stack
-                    return new Response(JSON.stringify({ error: "Failed to retrieve teams", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                }
-            }
-        } else if (url.pathname.startsWith('/api/teams/')) {
-             const pathParts = url.pathname.split('/');
-             const teamId = parseInt(pathParts[3], 10); // e.g., /api/teams/{id}
-
-             if (isNaN(teamId)) {
-                 return new Response(JSON.stringify({ error: "Invalid team ID in path" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-
-             if (request.method === 'GET' && pathParts.length === 4) { // Ensure it's just /api/teams/{id}
-                 // Get Single Team
-                 try {
-                     const { results } = await env.DB.prepare("SELECT * FROM teams WHERE id = ?").bind(teamId).all<Team>();
-                     if (results && results.length > 0) {
-                         return new Response(JSON.stringify(results[0]), { headers: { 'Content-Type': 'application/json' } });
-                     } else {
-                         return new Response(JSON.stringify({ error: "Team not found" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                     }
-                 } catch (e: any) {
-                     console.error("D1 get team error:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: "Failed to retrieve team", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                 }
-             } else if (request.method === 'PUT' && pathParts.length === 4) { // Ensure it's just /api/teams/{id}
-                 // Update Team
-                 try {
-                     // Allow updating name, health, mirror, status. Prevent changing code.
-                     const updates = await request.json<Partial<Omit<Team, 'id' | 'code' | 'created_at'>>>();
-                     delete updates.code; // Prevent changing code via PUT
-
-                     const stmt = env.DB.prepare(
-                         `UPDATE teams SET
-                            name = COALESCE(?, name),
-                            current_health = COALESCE(?, current_health),
-                            has_revive_mirror = COALESCE(?, has_revive_mirror),
-                            status = COALESCE(?, status)
-                          WHERE id = ?`
-                     );
-                     const result = await stmt.bind(
-                         updates.name,
-                         updates.current_health,
-                         updates.has_revive_mirror,
-                         updates.status,
-                         teamId
-                     ).run();
-
-                     if (result.success) {
-                         if (result.meta.rows_affected === 0) {
-                              return new Response(JSON.stringify({ success: false, message: "Team not found or no changes made." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                         }
-                         const updatedTeam = await env.DB.prepare("SELECT * FROM teams WHERE id = ?").bind(teamId).first<Team>();
-                         return new Response(JSON.stringify({ success: true, message: "Team updated.", team: updatedTeam }), { headers: { 'Content-Type': 'application/json' } });
-                     } else {
-                         console.error("D1 update team error:", result.error);
-                          // Check for unique constraint violation (shouldn't happen if code is deleted, but good practice)
-                          if (result.error?.includes("UNIQUE constraint failed: teams.code")) {
-                             return new Response(JSON.stringify({ error: `Team code already exists (should not happen via PUT).` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                          }
-                         return new Response(JSON.stringify({ error: "Failed to update team", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                     }
-                 } catch (e: any) {
-                     console.error("Worker exception during update team:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: `Exception updating team: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                 }
-             } else if (request.method === 'DELETE' && pathParts.length === 4) { // Ensure it's just /api/teams/{id}
-                 // Delete Team
-                 try {
-                     // Check if team is used in tournament_matches or has members
-                     const checkMatchesStmt = env.DB.prepare("SELECT COUNT(*) as count FROM tournament_matches WHERE team1_id = ? OR team2_id = ?").bind(teamId, teamId);
-                     const { results: checkMatchesResults } = await checkMatchesStmt.all<{ count: number }>();
-                     if (checkMatchesResults && checkMatchesResults[0].count > 0) {
-                          return new Response(JSON.stringify({ error: "Cannot delete team: It is used in scheduled matches." }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-                     // Need team_code to check members table
-                     const teamEntry = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(teamId).first<{ code: string }>();
-                     if (!teamEntry) {
-                          return new Response(JSON.stringify({ success: false, message: "Team not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     const checkMembersStmt = env.DB.prepare("SELECT COUNT(*) as count FROM members WHERE team_code = ?").bind(teamEntry.code);
-                     const { results: checkMembersResults } = await checkMembersStmt.all<{ count: number }>();
-                     if (checkMembersResults && checkMembersResults[0].count > 0) {
-                          return new Response(JSON.stringify({ error: "Cannot delete team: It has associated members. Delete members first." }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-
-                     const stmt = env.DB.prepare("DELETE FROM teams WHERE id = ?").bind(teamId);
-                     const result = await stmt.run();
-
-                     if (result.success) {
-                         if (result.meta.rows_affected === 0) {
-                              return new Response(JSON.stringify({ success: false, message: "Team not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                         }
-                         return new Response(JSON.stringify({ success: true, message: "Team deleted." }), { headers: { 'Content-Type': 'application/json' } });
-                     } else {
-                         console.error("D1 delete team error:", result.error);
-                         return new Response(JSON.stringify({ error: "Failed to delete team", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                     }
-                 } catch (e: any) {
-                     console.error("Worker exception during delete team:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: `Exception deleting team: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                 }
-             }
-        } else if (url.pathname.startsWith('/api/teams/') && url.pathname.endsWith('/members') && request.method === 'GET') {
-            // Get Members by Team Code
-            const pathParts = url.pathname.split('/');
-            const teamCode = pathParts[3]; // e.g., /api/teams/{team_code}/members
-
-            if (!teamCode) {
-                 return new Response(JSON.stringify({ error: "Team code missing in path" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-            }
-
+        // GET /api/teams
+        if (method === 'GET' && pathname === '/api/teams') {
             try {
-                // Optional: Validate team_code exists
-                const teamExists = await env.DB.prepare("SELECT id FROM teams WHERE code = ?").bind(teamCode).first();
-                if (!teamExists) {
-                     return new Response(JSON.stringify({ error: `Team code '${teamCode}' not found.` }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                }
-
-                const stmt = env.DB.prepare("SELECT * FROM members WHERE team_code = ? ORDER BY id ASC").bind(teamCode); // Order by ID for consistent player order
-                const { results } = await stmt.all<Member>();
-                return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
+                // Assuming Team type now matches D1 structure with number id
+                const { results } = await env.DB.prepare("SELECT * FROM teams").all<Team>();
+                response = jsonResponse(results); // Wrap in ApiResponse
             } catch (e: any) {
-                console.error("D1 get members by team error:", e.stack); // Use e.stack
-                return new Response(JSON.stringify({ error: "Failed to retrieve members for team", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                console.error("Worker: Failed to list teams:", e);
+                response = errorResponse(e.message);
             }
         }
-
-        // --- Bulk Import Members Endpoint ---
-         if (url.pathname === '/api/members/bulk' && request.method === 'POST') {
-            try {
-                const membersData = await request.json<BulkMemberRow[]>();
-                if (!Array.isArray(membersData)) {
-                     return new Response(JSON.stringify({ error: "Invalid payload: Expected an array of members." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                }
-
-                // Validate team codes exist before batch insert
-                const teamCodes = [...new Set(membersData.map(m => m.team_code))]; // Get unique team codes
-                if (teamCodes.length === 0) {
-                     return new Response(JSON.stringify({ error: "No member data provided or missing team_code." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                }
-
-                const teamCheckStmt = env.DB.prepare(`SELECT code FROM teams WHERE code IN (${teamCodes.map(() => '?').join(',')})`).bind(...teamCodes);
-                const { results: existingTeams } = await teamCheckStmt.all<{ code: string }>();
-                const existingTeamCodes = new Set(existingTeams?.map(t => t.code) || []);
-
-                const invalidTeamCodes = teamCodes.filter(code => !existingTeamCodes.has(code));
-                if (invalidTeamCodes.length > 0) {
-                     return new Response(JSON.stringify({ error: `Bulk import failed: Invalid team codes found: ${invalidTeamCodes.join(', ')}. Please ensure teams exist before importing members.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                }
-
-                // Basic validation for each member row
-                 for (const member of membersData) {
-                     if (!member.team_code || !member.nickname) {
-                          return new Response(JSON.stringify({ error: `Invalid member data found in input: team_code='${member.team_code}', nickname='${member.nickname}'. Team code and nickname are required.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        // GET /api/teams/:id (Using ID now instead of code)
+        else if (method === 'GET' && pathname.match(/^\/api\/teams\/\d+$/)) {
+             const parts = pathname.split('/');
+             const teamId = parseInt(parts[3], 10);
+             if (!isNaN(teamId)) {
+                 try {
+                     const team = await env.DB.prepare("SELECT * FROM teams WHERE id = ?").bind(teamId).first<Team>();
+                     if (team) {
+                         response = jsonResponse(team);
+                     } else {
+                         response = errorResponse("Team not found", 404);
                      }
+                 } catch (e: any) {
+                     console.error(`Worker: Failed to get team ${teamId}:`, e);
+                     response = errorResponse(e.message);
                  }
+             } else {
+                 response = errorResponse("Invalid team ID in path", 400);
+             }
+        }
+        // GET /api/members
+        else if (method === 'GET' && pathname === '/api/members') {
+            try {
+                // Assuming Member type now matches D1 structure with number id and team_code
+                const teamCode = url.searchParams.get('team_code'); // Still filter by team_code
+                let query = "SELECT * FROM members";
+                let params: string[] = [];
+                if (teamCode) {
+                    query += " WHERE team_code = ?";
+                    params.push(teamCode);
+                }
+                const { results } = await env.DB.prepare(query).bind(...params).all<Member>();
+                response = jsonResponse(results); // Wrap in ApiResponse
+            } catch (e: any) {
+                console.error("Worker: Failed to list members:", e);
+                response = errorResponse(e.message);
+            }
+        }
+        // GET /api/members/:id
+        else if (method === 'GET' && pathname.match(/^\/api\/members\/\d+$/)) {
+             const parts = pathname.split('/');
+             const memberId = parseInt(parts[3], 10);
+             if (!isNaN(memberId)) {
+                 try {
+                     const member = await env.DB.prepare("SELECT * FROM members WHERE id = ?").bind(memberId).first<Member>();
+                     if (member) {
+                         response = jsonResponse(member);
+                     } else {
+                         response = errorResponse("Member not found", 404);
+                     }
+                 } catch (e: any) {
+                     console.error(`Worker: Failed to get member ${memberId}:`, e);
+                     response = errorResponse(e.message);
+                 }
+             } else {
+                 response = errorResponse("Invalid member ID in path", 400);
+             }
+        }
 
+        // --- New Song Endpoints ---
 
-                const stmt = env.DB.prepare("INSERT INTO members (team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                const now = Math.floor(Date.now() / 1000);
-                const insertBatch = membersData.map(member => {
-                     // Parse is_admin string to number (0 or 1)
-                     const isAdmin = member.is_admin !== undefined ? (parseInt(member.is_admin, 10) > 0 ? 1 : 0) : 0;
+        // GET /api/songs (Get songs from D1, supports filtering/search)
+        else if (method === 'GET' && pathname === '/api/songs') {
+            try {
+                // Implement filtering/search based on query parameters (e.g., ?category=...&search=...)
+                // For simplicity, fetching all for now
+                const { results } = await env.DB.prepare("SELECT * FROM songs").all<Song>();
 
-                     return stmt.bind(
-                         member.team_code,
-                         member.color || null,
-                         member.job || null,
-                         member.maimai_id || null,
-                         member.nickname,
-                         member.qq_number || null,
-                         member.avatar_url || null,
-                         now, // joined_at
-                         now, // updated_at (initial)
-                         member.kinde_user_id || null,
-                         isAdmin
-                     );
+                // Optional: Parse levels_json and construct fullCoverUrl for each song
+                const songsWithDetails = results.map(song => {
+                    const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) : undefined;
+                    const fullCoverUrl = song.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${song.cover_filename}` : undefined; // Assuming SONG_COVER_BUCKET binding
+                    return { ...song, parsedLevels, fullCoverUrl };
                 });
 
-                // Use batch for efficiency
-                const results = await env.DB.batch(insertBatch);
-
-                // Check results for errors (batch might succeed partially)
-                const errors = results.filter(r => !r.success);
-                const successCount = results.length - errors.length;
-
-                if (errors.length > 0) {
-                     console.error("D1 bulk create members errors:", errors);
-                     return new Response(JSON.stringify({
-                         success: successCount > 0, // Consider success if at least one row inserted
-                         message: `Bulk import completed with errors. Successfully imported ${successCount} members. Failed to import ${errors.length} members.`,
-                         errors: errors.map(e => e.error)
-                     }), { status: successCount > 0 ? 207 : 500, headers: { 'Content-Type': 'application/json' } }); // 207 Multi-Status
-                }
-
-                return new Response(JSON.stringify({ success: true, message: `Bulk import successful. ${successCount} members imported.` }), { status: 201, headers: { 'Content-Type': 'application/json' } });
-
+                response = jsonResponse(songsWithDetails);
             } catch (e: any) {
-                console.error("Worker exception during bulk create members:", e.stack); // Use e.stack
-                return new Response(JSON.stringify({ error: `Exception during bulk import members: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                console.error("Worker: Failed to list songs:", e);
+                response = errorResponse(e.message);
             }
         }
 
+        // POST /admin/sync_songs_from_r2 (Admin endpoint to sync songs from R2 JSON)
+        // This should ideally be protected by authentication/authorization
+        else if (method === 'POST' && pathname === '/admin/sync_songs_from_r2') {
+             // TODO: Add authentication/authorization check here
 
-        // --- Tournament Matches Management Endpoints ---
-        if (url.pathname === '/api/tournament_matches') {
-            if (request.method === 'POST') {
-                // Create Tournament Match
-                try {
-                    const matchData = await request.json<CreateTournamentMatchPayload>(); // Use the specific payload type
-                     if (!matchData.tournament_round || matchData.match_number_in_round === undefined || matchData.team1_id === null || matchData.team2_id === null) {
-                         return new Response(JSON.stringify({ error: "Tournament round, match number, team1_id, and team2_id are required." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     if (matchData.team1_id === matchData.team2_id) {
-                          return new Response(JSON.stringify({ error: "队伍A和队伍B不能是同一支队伍。" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-                     // Validate team IDs exist
-                     const team1Exists = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(matchData.team1_id).first();
-                     const team2Exists = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(matchData.team2_id).first();
-                     if (!team1Exists || !team2Exists) {
-                          return new Response(JSON.stringify({ error: "One or both team IDs not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-                     // Check for unique constraint violation (round + number)
-                     const existingMatch = await env.DB.prepare("SELECT id FROM tournament_matches WHERE tournament_round = ? AND match_number_in_round = ?").bind(matchData.tournament_round, matchData.match_number_in_round).first();
-                     if (existingMatch) {
-                          return new Response(JSON.stringify({ error: `Match ${matchData.match_number_in_round} in round '${matchData.tournament_round}' already exists.` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-
-                    const stmt = env.DB.prepare("INSERT INTO tournament_matches (tournament_round, match_number_in_round, team1_id, team2_id, team1_player_order, team2_player_order, scheduled_time, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                    const result = await stmt.bind(
-                        matchData.tournament_round,
-                        matchData.match_number_in_round,
-                        matchData.team1_id,
-                        matchData.team2_id,
-                        matchData.team1_player_order || null,
-                        matchData.team2_player_order || null,
-                        matchData.scheduled_time || null,
-                        new Date().toISOString(),
-                        'scheduled' // Default status
-                    ).run();
-
-                    if (result.success) {
-                        // Fetch the newly created match to return it with its ID and team details
-                         const newMatchStmt = env.DB.prepare(`
-                             SELECT
-                                 tm.*,
-                                 t1.code AS team1_code, t1.name AS team1_name,
-                                 t2.code AS team2_code, t2.name AS team2_name
-                             FROM tournament_matches tm
-                             JOIN teams t1 ON tm.team1_id = t1.id
-                             JOIN teams t2 ON tm.team2_id = t2.id
-                             WHERE tm.id = ?
-                         `);
-                         // Use .first() as we expect only one result by ID
-                         const newMatchResult = await newMatchStmt.bind(result.meta.last_row_id).first<TournamentMatch>();
-
-                        return new Response(JSON.stringify({ success: true, message: "Tournament match created.", tournamentMatch: newMatchResult }), { status: 201, headers: { 'Content-Type': 'application/json' } });
-                    } else {
-                        console.error("D1 create tournament match error:", result.error);
-                        return new Response(JSON.stringify({ error: "Failed to create tournament match", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                    }
-                } catch (e: any) {
-                    console.error("Worker exception during create tournament match:", e.stack); // Use e.stack
-                    return new Response(JSON.stringify({ error: `Exception creating tournament match: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                }
-            } else if (request.method === 'GET') {
-                // Get All Tournament Matches (with team names and codes)
-                try {
-                    // Join with teams table to get team names and codes
-                    const stmt = env.DB.prepare(`
-                        SELECT
-                            tm.*,
-                            t1.code AS team1_code, t1.name AS team1_name,
-                            t2.code AS team2_code, t2.name AS team2_name,
-                            tw.code AS winner_team_code, tw.name AS winner_team_name
-                        FROM tournament_matches tm
-                        JOIN teams t1 ON tm.team1_id = t1.id
-                        JOIN teams t2 ON tm.team2_id = t2.id
-                        LEFT JOIN teams tw ON tm.winner_team_id = tw.id
-                        ORDER BY tm.tournament_round, tm.match_number_in_round ASC
-                    `);
-                    // The TournamentMatch type includes the joined fields as optional, which is fine for .all()
-                    const { results } = await stmt.all<TournamentMatch>();
-
-                    return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
-                } catch (e: any) {
-                    console.error("D1 get tournament matches error:", e.stack); // Use e.stack
-                    return new Response(JSON.stringify({ error: "Failed to retrieve tournament matches", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                }
-            }
-        } else if (url.pathname.startsWith('/api/tournament_matches/')) {
-             const pathParts = url.pathname.split('/');
-             // Check if the path is /api/tournament_matches/{id} or /api/tournament_matches/{id}/...
-             const isSingleMatchEndpoint = pathParts.length >= 4 && !isNaN(parseInt(pathParts[3], 10));
-             const tournamentMatchId = isSingleMatchEndpoint ? parseInt(pathParts[3], 10) : NaN;
-
-             if (isNaN(tournamentMatchId) && isSingleMatchEndpoint) { // Only return error if ID was expected but invalid
-                 return new Response(JSON.stringify({ error: "Invalid tournament match ID in path" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-
-             // --- Get Single Tournament Match ---
-             if (request.method === 'GET' && pathParts.length === 4 && isSingleMatchEndpoint) {
-                 try {
-                     const stmt = env.DB.prepare(`
-                         SELECT
-                             tm.*,
-                             t1.code AS team1_code, t1.name AS team1_name,
-                             t2.code AS team2_code, t2.name AS team2_name,
-                             tw.code AS winner_team_code, tw.name AS winner_team_name
-                         FROM tournament_matches tm
-                         JOIN teams t1 ON tm.team1_id = t1.id
-                         JOIN teams t2 ON tm.team2_id = t2.id
-                         LEFT JOIN teams tw ON tm.winner_team_id = tw.id
-                         WHERE tm.id = ?
-                     `);
-                     const { results } = await stmt.bind(tournamentMatchId).all<TournamentMatch>();
-
-                     if (results && results.length > 0) {
-                         return new Response(JSON.stringify(results[0]), { headers: { 'Content-Type': 'application/json' } });
-                     } else {
-                         return new Response(JSON.stringify({ error: "Tournament match not found" }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                     }
-                 } catch (e: any) {
-                     console.error("D1 get tournament match error:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: "Failed to retrieve tournament match", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+             try {
+                 // 1. Fetch JSON from R2
+                 const object = await env.SONG_JSON_BUCKET.get(env.SONG_JSON_KEY); // Assuming SONG_JSON_KEY binding
+                 if (!object) {
+                     return errorResponse(`Song JSON file not found in R2 at key: ${env.SONG_JSON_KEY}`, 404);
                  }
-             }
-             // --- Update Tournament Match ---
-             else if (request.method === 'PUT' && pathParts.length === 4 && isSingleMatchEndpoint) {
-                 try {
-                     // Allow updating round, number, team IDs, player order, scheduled time
-                     const updates = await request.json<Partial<Omit<TournamentMatch, 'id' | 'match_do_id' | 'status' | 'winner_team_id' | 'created_at' | 'team1_code' | 'team1_name' | 'team2_code' | 'team2_name' | 'winner_team_code' | 'winner_team_name'>>>();
-                     // Prevent changing status or winner_team_id via this endpoint, use specific actions
-                     // delete updates.status;
-                     // delete updates.winner_team_id;
+                 const songListData: R2SongList = await object.json();
 
-                     // Optional: Validate team IDs if provided in updates
-                     if (updates.team1_id !== undefined && updates.team1_id !== null) { // Check for undefined and null
-                         const teamExists = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(updates.team1_id).first();
-                         if (!teamExists) {
-                              return new Response(JSON.stringify({ error: `Team1 ID '${updates.team1_id}' not found.` }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                         }
+                 // 2. Check version (optional but recommended)
+                 // const currentVersion = await env.DB.prepare("SELECT value FROM settings WHERE key = 'song_data_version'").first<{ value: string }>();
+                 // if (currentVersion && currentVersion.value === songListData.data) {
+                 //     console.log("Worker: Song data version is the same. Skipping sync.");
+                 //     return jsonResponse({ message: "Song data is already up to date." });
+                 // }
+
+                 // 3. Clear existing songs table (or perform upsert logic)
+                 // Clearing is simpler for initial setup, upsert is better for updates
+                 await env.DB.prepare("DELETE FROM songs").run();
+                 console.log("Worker: Cleared existing songs table.");
+
+                 // 4. Insert new songs
+                 const insertStmt = env.DB.prepare(
+                     `INSERT INTO songs (title, category, bpm, levels_json, type, cover_filename, source_data_version)
+                      VALUES (?, ?, ?, ?, ?, ?, ?)`
+                 );
+
+                 const songsToInsert = songListData.曲目列表.map(song => ({
+                     title: song.曲名,
+                     category: song.分类,
+                     bpm: song.BPM,
+                     levels_json: JSON.stringify(song.等级),
+                     type: song.类型,
+                     cover_filename: song.封面,
+                     source_data_version: songListData.data,
+                 }));
+
+                 // D1 batch insertion
+                 const insertResults = await env.DB.batch(songsToInsert.map(song => insertStmt.bind(
+                     song.title, song.category, song.bpm, song.levels_json, song.type, song.cover_filename, song.source_data_version
+                 )));
+
+                 // 5. Update version setting (optional)
+                 // await env.DB.prepare("REPLACE INTO settings (key, value) VALUES ('song_data_version', ?)").bind(songListData.data).run();
+
+                 console.log(`Worker: Synced ${insertResults.length} songs from R2.`);
+                 response = jsonResponse({ success: true, message: `Successfully synced ${insertResults.length} songs.` });
+
+             } catch (e: any) {
+                 console.error("Worker: Failed to sync songs from R2:", e);
+                 response = errorResponse(`Failed to sync songs: ${e.message}`);
+             }
+        }
+
+
+        // --- New Member Song Preference Endpoints ---
+
+        // POST /api/member_song_preferences
+        else if (method === 'POST' && pathname === '/api/member_song_preferences') {
+             // TODO: Add authentication/authorization check (ensure member_id matches logged-in user or admin)
+             try {
+                 const payload: MemberSongPreference = await request.json();
+
+                 if (!payload.member_id || !payload.tournament_stage || !payload.song_id || !payload.selected_difficulty) {
+                     return errorResponse("Missing required fields for member song preference.", 400);
+                 }
+
+                 // Optional: Validate member_id, song_id exist in DB
+
+                 const stmt = env.DB.prepare(
+                     `INSERT INTO member_song_preferences (member_id, tournament_stage, song_id, selected_difficulty, created_at)
+                      VALUES (?, ?, ?, ?, ?)
+                      ON CONFLICT(member_id, tournament_stage, song_id, selected_difficulty) DO UPDATE SET
+                          created_at = excluded.created_at -- Simple update on conflict
+                     `
+                 );
+
+                 const result = await stmt.bind(
+                     payload.member_id,
+                     payload.tournament_stage,
+                     payload.song_id,
+                     payload.selected_difficulty,
+                     new Date().toISOString()
+                 ).run();
+
+                 if (result.success) {
+                     // Fetch the inserted/updated preference to return
+                     const newPreference = await env.DB.prepare("SELECT * FROM member_song_preferences WHERE id = ?").bind(result.meta.last_row_id).first<MemberSongPreference>();
+                     response = jsonResponse(newPreference, 201);
+                 } else {
+                     console.error("Worker: Failed to save member song preference:", result.error);
+                     response = errorResponse(result.error || "Failed to save preference.");
+                 }
+
+             } catch (e: any) {
+                 console.error("Worker: Exception saving member song preference:", e);
+                 response = errorResponse(e.message);
+             }
+        }
+
+        // GET /api/member_song_preferences?member_id=:id&stage=:stage
+        else if (method === 'GET' && pathname === '/api/member_song_preferences') {
+             // TODO: Add authentication/authorization check (ensure member_id matches logged-in user or admin)
+             try {
+                 const memberId = url.searchParams.get('member_id');
+                 const stage = url.searchParams.get('stage');
+
+                 if (!memberId || !stage) {
+                     return errorResponse("Missing member_id or stage query parameter.", 400);
+                 }
+
+                 const memberIdNum = parseInt(memberId, 10);
+                 if (isNaN(memberIdNum)) {
+                     return errorResponse("Invalid member_id.", 400);
+                 }
+
+                 // Join with songs table to get song details
+                 const query = `
+                     SELECT
+                         msp.*,
+                         s.title AS song_title,
+                         s.cover_filename AS cover_filename,
+                         s.levels_json AS levels_json -- Include levels_json to parse difficulty
+                     FROM member_song_preferences msp
+                     JOIN songs s ON msp.song_id = s.id
+                     WHERE msp.member_id = ? AND msp.tournament_stage = ?
+                 `;
+
+                 const { results } = await env.DB.prepare(query).bind(memberIdNum, stage).all<MemberSongPreference & { levels_json: string | null }>();
+
+                 // Optional: Parse levels_json and construct fullCoverUrl for each preference
+                 const preferencesWithDetails = results.map(pref => {
+                     const parsedLevels = pref.levels_json ? JSON.parse(pref.levels_json) : undefined;
+                     const fullCoverUrl = pref.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${pref.cover_filename}` : undefined; // Assuming SONG_COVER_BUCKET binding
+                     // Remove levels_json from the final object if you don't want to expose it directly
+                     const { levels_json, ...rest } = pref;
+                     return { ...rest, parsedLevels, fullCoverUrl };
+                 });
+
+
+                 response = jsonResponse(preferencesWithDetails);
+
+             } catch (e: any) {
+                 console.error("Worker: Failed to get member song preferences:", e);
+                 response = errorResponse(e.message);
+             }
+        }
+
+
+        // --- Tournament Match Endpoints (Updated) ---
+
+        // GET /api/tournament_matches (Updated to parse JSON fields)
+        else if (method === 'GET' && pathname === '/api/tournament_matches') {
+            try {
+                const query = `
+                    SELECT
+                        tm.*,
+                        t1.code AS team1_code,
+                        t1.name AS team1_name,
+                        t2.code AS team2_code,
+                        t2.name AS team2_name,
+                        tw.code AS winner_team_code,
+                        tw.name AS winner_team_name
+                    FROM tournament_matches tm
+                    JOIN teams t1 ON tm.team1_id = t1.id
+                    JOIN teams t2 ON tm.team2_id = t2.id
+                    LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+                    ORDER BY tm.created_at DESC; -- Order by creation date, or scheduled_time
+                `;
+                const { results } = await env.DB.prepare(query).all<TournamentMatch>();
+
+                // Parse JSON fields before returning
+                const matchesWithParsedData = results.map(match => ({
+                    ...match,
+                    team1_player_order: match.team1_player_order_json ? JSON.parse(match.team1_player_order_json) : null,
+                    team2_player_order: match.team2_player_order_json ? JSON.parse(match.team2_player_order_json) : null,
+                    match_song_list: match.match_song_list_json ? JSON.parse(match.match_song_list_json) : null,
+                    // Remove raw JSON fields if not needed by frontend
+                    // team1_player_order_json: undefined,
+                    // team2_player_order_json: undefined,
+                    // match_song_list_json: undefined,
+                }));
+
+                response = jsonResponse(matchesWithParsedData);
+            } catch (e: any) {
+                console.error("Worker: Failed to list tournament matches:", e);
+                response = errorResponse(e.message);
+            }
+        }
+
+        // POST /api/tournament_matches (Updated for new table structure, no player order/songs yet)
+        else if (method === 'POST' && pathname === '/api/tournament_matches') {
+            // TODO: Add authentication/authorization check
+            try {
+                // Use a simplified payload for creation, player order and songs are set in confirm_setup
+                interface SimpleCreateTournamentMatchPayload {
+                    round_name: string;
+                    team1_id: number | null;
+                    team2_id: number | null;
+                    scheduled_time?: string | null;
+                }
+                const payload: SimpleCreateTournamentMatchPayload = await request.json();
+
+                if (!payload.round_name || payload.team1_id === null || payload.team2_id === null) {
+                     return errorResponse("Missing required fields: round_name, team1_id, team2_id", 400);
+                }
+
+                // Basic validation for team IDs
+                const team1 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team1_id).first();
+                const team2 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team2_id).first();
+                if (!team1 || !team2) {
+                     return errorResponse("Invalid team1_id or team2_id", 400);
+                }
+
+                const stmt = env.DB.prepare(
+                    `INSERT INTO tournament_matches (round_name, team1_id, team2_id, scheduled_time, status, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`
+                );
+
+                const result = await stmt.bind(
+                    payload.round_name,
+                    payload.team1_id,
+                    payload.team2_id,
+                    payload.scheduled_time || null,
+                    'scheduled', // New matches start as scheduled
+                    new Date().toISOString(),
+                    new Date().toISOString()
+                ).run();
+
+                if (result.success) {
+                    // Fetch the newly created match to return it with its ID and default status
+                    const newMatch = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(result.meta.last_row_id).first<TournamentMatch>();
+                    response = jsonResponse(newMatch, 201);
+                } else {
+                    console.error("Worker: Failed to create tournament match:", result.error);
+                    response = errorResponse(result.error || "Failed to create match.");
+                }
+
+            } catch (e: any) {
+                console.error("Worker: Exception creating tournament match:", e);
+                response = errorResponse(e.message);
+            }
+        }
+
+        // PUT /api/tournament_matches/:id/confirm_setup (New endpoint for Staff to finalize setup)
+        else if (method === 'PUT' && pathname.match(/^\/api\/tournament_matches\/\d+\/confirm_setup$/)) {
+             // TODO: Add authentication/authorization check (Staff only)
+             const parts = pathname.split('/');
+             const tournamentMatchId = parseInt(parts[3], 10);
+
+             if (!isNaN(tournamentMatchId)) {
+                 try {
+                     interface ConfirmSetupPayload {
+                         team1_player_order: number[];
+                         team2_player_order: number[];
+                         match_song_list: MatchSong[];
                      }
-                      if (updates.team2_id !== undefined && updates.team2_id !== null) { // Check for undefined and null
-                         const teamExists = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(updates.team2_id).first();
-                         if (!teamExists) {
-                              return new Response(JSON.stringify({ error: `Team2 ID '${updates.team2_id}' not found.` }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                         }
+                     const payload: ConfirmSetupPayload = await request.json();
+
+                     // Basic payload validation
+                     if (!Array.isArray(payload.team1_player_order) || !Array.isArray(payload.team2_player_order) || !Array.isArray(payload.match_song_list) || payload.team1_player_order.length === 0 || payload.team2_player_order.length === 0 || payload.match_song_list.length === 0) {
+                         return errorResponse("Invalid payload: player orders and song list must be non-empty arrays.", 400);
                      }
-                     // Check if team IDs are the same if both are provided
-                     if (updates.team1_id !== undefined && updates.team1_id !== null && updates.team2_id !== undefined && updates.team2_id !== null && updates.team1_id === updates.team2_id) {
-                          return new Response(JSON.stringify({ error: "队伍A和队伍B不能是同一支队伍。" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+                     // TODO: More robust validation: check if player IDs exist and belong to the correct teams, check if song IDs exist.
+
+                     // Fetch the match to ensure it exists and is in a valid state (e.g., 'scheduled' or 'pending_song_confirmation')
+                     const match = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<TournamentMatch>();
+                     if (!match) {
+                         return errorResponse("Tournament match not found.", 404);
+                     }
+                     if (match.status !== 'scheduled' && match.status !== 'pending_song_confirmation') {
+                          return errorResponse(`Match status is '${match.status}'. Must be 'scheduled' or 'pending_song_confirmation' to confirm setup.`, 400);
                      }
 
 
                      const stmt = env.DB.prepare(
                          `UPDATE tournament_matches SET
-                            tournament_round = COALESCE(?, tournament_round),
-                            match_number_in_round = COALESCE(?, match_number_in_round),
-                            team1_id = COALESCE(?, team1_id),
-                            team2_id = COALESCE(?, team2_id),
-                            team1_player_order = COALESCE(?, team1_player_order),
-                            team2_player_order = COALESCE(?, team2_player_order),
-                            scheduled_time = COALESCE(?, scheduled_time)
+                            team1_player_order_json = ?,
+                            team2_player_order_json = ?,
+                            match_song_list_json = ?,
+                            status = ?,
+                            updated_at = ?
                           WHERE id = ?`
                      );
+
                      const result = await stmt.bind(
-                         updates.tournament_round,
-                         updates.match_number_in_round,
-                         updates.team1_id,
-                         updates.team2_id,
-                         updates.team1_player_order,
-                         updates.team2_player_order,
-                         updates.scheduled_time,
+                         JSON.stringify(payload.team1_player_order),
+                         JSON.stringify(payload.team2_player_order),
+                         JSON.stringify(payload.match_song_list),
+                         'ready_to_start', // Status changes to ready_to_start
+                         new Date().toISOString(),
                          tournamentMatchId
                      ).run();
 
                      if (result.success) {
-                         if (result.meta.rows_affected === 0) {
-                              return new Response(JSON.stringify({ success: false, message: "Tournament match not found or no changes made." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                         }
-                         // Fetch the updated match with team details
-                         const updatedMatchStmt = env.DB.prepare(`
-                             SELECT
-                                 tm.*,
-                                 t1.code AS team1_code, t1.name AS team1_name,
-                                 t2.code AS team2_code, t2.name AS team2_name,
-                                 tw.code AS winner_team_code, tw.name AS winner_team_name
-                             FROM tournament_matches tm
-                             JOIN teams t1 ON tm.team1_id = t1.id
-                             JOIN teams t2 ON tm.team2_id = t2.id
-                             LEFT JOIN teams tw ON tm.winner_team_id = tw.id
-                             WHERE tm.id = ?
-                         `);
-                          const { results: updatedResults } = await updatedMatchStmt.bind(tournamentMatchId).all<TournamentMatch>();
-                          const updatedMatch = updatedResults && updatedResults.length > 0 ? updatedResults[0] : null;
-
-                         return new Response(JSON.stringify({ success: true, message: "Tournament match updated.", tournamentMatch: updatedMatch }), { headers: { 'Content-Type': 'application/json' } });
+                         // Fetch the updated match
+                         const updatedMatch = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<TournamentMatch>();
+                         response = jsonResponse(updatedMatch);
                      } else {
-                         console.error("D1 update tournament match error:", result.error);
-                          if (result.error?.includes("UNIQUE constraint failed: tournament_matches.tournament_round, tournament_matches.match_number_in_round")) {
-                             return new Response(JSON.stringify({ error: `Match number ${updates.match_number_in_round} in round '${updates.tournament_round}' already exists.` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                          }
-                         return new Response(JSON.stringify({ error: "Failed to update tournament match", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                         console.error("Worker: Failed to confirm match setup:", result.error);
+                         response = errorResponse(result.error || "Failed to confirm setup.");
                      }
+
                  } catch (e: any) {
-                     console.error("Worker exception during update tournament match:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: `Exception updating tournament match: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                     console.error(`Worker: Exception confirming match setup ${tournamentMatchId}:`, e);
+                     response = errorResponse(e.message);
                  }
+             } else {
+                 response = errorResponse("Invalid tournament match ID", 400);
              }
-             // --- Delete Tournament Match ---
-             else if (request.method === 'DELETE' && pathParts.length === 4 && isSingleMatchEndpoint) {
-                 // Delete Tournament Match
+        }
+
+
+        // POST /api/tournament_matches/:id/start_live (Updated logic)
+        else if (method === 'POST' && pathname.match(/^\/api\/tournament_matches\/\d+\/start_live$/)) {
+             // TODO: Add authentication/authorization check (Staff only)
+             const parts = pathname.split('/');
+             const tournamentMatchId = parseInt(parts[3], 10);
+
+             if (!isNaN(tournamentMatchId)) {
                  try {
-                     // Prevent deleting if it's currently live or has archived data linked
-                     const matchEntry = await env.DB.prepare("SELECT match_do_id FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<{ match_do_id: string | null }>();
-                     if (!matchEntry) {
-                          return new Response(JSON.stringify({ success: false, message: "Tournament match not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+                     // 1. Fetch the match details from D1 (must be 'ready_to_start')
+                     const match = await env.DB.prepare(
+                         `SELECT tm.*, t1.name AS team1_name, t2.name AS team2_name
+                          FROM tournament_matches tm
+                          JOIN teams t1 ON tm.team1_id = t1.id
+                          JOIN teams t2 ON tm.team2_id = t2.id
+                          WHERE tm.id = ?`
+                     ).bind(tournamentMatchId).first<TournamentMatch>();
+
+                     if (!match) {
+                         return errorResponse("Scheduled match not found", 404);
                      }
-                     if (matchEntry.match_do_id) {
-                          // Check if the linked DO still exists and is not archived_in_d1
-                          // This is complex. A simpler check is just if match_do_id is present.
-                          // If match_do_id is present, assume it was started and might have archives.
-                          // You might need a more robust check here depending on desired behavior.
-                          return new Response(JSON.stringify({ error: "Cannot delete tournament match: It has been started or completed." }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+                     if (match.status === 'live' && match.match_do_id) {
+                         // If already live, just return the existing DO ID
+                         console.log(`Worker: Match ${tournamentMatchId} is already live with DO ${match.match_do_id}. Returning existing DO ID.`);
+                         return jsonResponse({ message: "Match is already live.", match_do_id: match.match_do_id });
+                     }
+                     if (match.status !== 'ready_to_start') {
+                          return errorResponse(`Match status is '${match.status}'. Must be 'ready_to_start' to start live.`, 400);
+                     }
+                     if (!match.team1_player_order_json || !match.team2_player_order_json || !match.match_song_list_json) {
+                          return errorResponse("Match setup is incomplete (player order or song list missing).", 400);
                      }
 
+                     // 2. Fetch member details for both teams
+                     // Assuming members table uses team_code, need to get team codes first
+                     const team1 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team1_id).first<{ code: string }>();
+                     const team2 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team2_id).first<{ code: string }>();
+                     if (!team1 || !team2) {
+                          return errorResponse("Could not fetch team codes for members.", 500);
+                     }
 
-                     const stmt = env.DB.prepare("DELETE FROM tournament_matches WHERE id = ?").bind(tournamentMatchId);
-                     const result = await stmt.run();
+                     const team1Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team1.code).all<Member>();
+                     const team2Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team2.code).all<Member>();
 
-                     if (result.success) {
-                         if (result.meta.rows_affected === 0) {
-                              return new Response(JSON.stringify({ success: false, message: "Tournament match not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+                     if (!team1Members.results || team1Members.results.length === 0 || !team2Members.results || team2Members.results.length === 0) {
+                          return errorResponse("Could not fetch members for one or both teams.", 500);
+                     }
+
+                     // 3. Parse player order and song list JSON
+                     const team1PlayerOrderIds: number[] = JSON.parse(match.team1_player_order_json);
+                     const team2PlayerOrderIds: number[] = JSON.parse(match.team2_player_order_json);
+                     const matchSongList: MatchSong[] = JSON.parse(match.match_song_list_json);
+
+                     // Basic validation for parsed data
+                     if (!Array.isArray(team1PlayerOrderIds) || !Array.isArray(team2PlayerOrderIds) || !Array.isArray(matchSongList) || team1PlayerOrderIds.length === 0 || team2PlayerOrderIds.length === 0 || matchSongList.length === 0) {
+                          return errorResponse("Parsed setup data is invalid.", 500); // Should not happen if confirm_setup validated
+                     }
+                     // TODO: More robust validation of parsed IDs/songs against actual members/songs
+
+                     // 4. Generate a DO ID (e.g., based on tournamentMatchId)
+                     const doIdString = `match-${tournamentMatchId}`; // Simple mapping
+
+                     // 5. Get the DO instance and prepare initialization payload
+                     const doStub = getMatchDO(doIdString, env);
+                     const initPayload: MatchScheduleData = {
+                         tournamentMatchId: tournamentMatchId,
+                         round_name: match.round_name, // Pass round_name
+                         team1_id: match.team1_id, // Pass team IDs
+                         team2_id: match.team2_id,
+                         team1_name: match.team1_name || 'Team A',
+                         team2_name: match.team2_name || 'Team B',
+                         team1_members: team1Members.results, // Pass full member objects
+                         team2_members: team2Members.results,
+                         team1_player_order_ids: team1PlayerOrderIds, // Pass ordered IDs
+                         team2_player_order_ids: team2PlayerOrderIds,
+                         match_song_list: matchSongList, // Pass the song list
+                     };
+
+                     // 6. Forward initialization request to the DO
+                     const doResponse = await forwardRequestToDO(doIdString, env, request, '/internal/initialize-from-schedule', 'POST', initPayload);
+
+                     if (doResponse.ok) {
+                         // 7. Update the tournament_matches record in D1
+                         const updateStmt = env.DB.prepare("UPDATE tournament_matches SET status = ?, match_do_id = ?, updated_at = ? WHERE id = ?");
+                         const updateResult = await updateStmt.bind('live', doIdString, new Date().toISOString(), tournamentMatchId).run();
+
+                         if (updateResult.success) {
+                              console.log(`Worker: Tournament match ${tournamentMatchId} status updated to 'live' with DO ${doIdString}.`);
+                              // Return the DO's initialization response (or a simplified success)
+                              const doResult = await doResponse.json(); // Assuming DO returns JSON
+                              response = jsonResponse({ message: "Match started live.", match_do_id: doIdString, do_init_result: doResult });
+                         } else {
+                              console.error(`Worker: Failed to update tournament_matches status for ${tournamentMatchId}:`, updateResult.error);
+                              // Decide how to handle this - DO is initialized, but schedule not updated.
+                              // For now, return error but DO is likely fine.
+                              response = errorResponse(`Match started live in DO, but failed to update schedule status: ${updateResult.error}`, 500);
                          }
-                         return new Response(JSON.stringify({ success: true, message: "Tournament match deleted." }), { headers: { 'Content-Type': 'application/json' } });
                      } else {
-                         console.error("D1 delete tournament match error:", result.error);
-                         return new Response(JSON.stringify({ error: "Failed to delete tournament match", details: result.error }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                         // DO initialization failed
+                         const errorBody = await doResponse.json(); // Assuming DO returns JSON error
+                         console.error(`Worker: Failed to initialize DO ${doIdString} for match ${tournamentMatchId}:`, errorBody);
+                         response = errorResponse(`Failed to initialize live match in Durable Object: ${errorBody.message || errorBody.error}`, doResponse.status);
                      }
+
                  } catch (e: any) {
-                     console.error("Worker exception during delete tournament match:", e.stack); // Use e.stack
-                     return new Response(JSON.stringify({ error: `Exception deleting tournament match: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                     console.error(`Worker: Exception starting live match ${tournamentMatchId}:`, e);
+                     response = errorResponse(`Exception starting live match: ${e.message}`);
                  }
-             }
-             // --- Start a Live Match from Schedule ---
-             else if (url.pathname.endsWith('/start_live') && request.method === 'POST' && isSingleMatchEndpoint) {
-                // tournamentMatchId is already parsed above
-
-                try {
-                    // 1. Fetch the tournament match details and associated teams
-                    const matchStmt = env.DB.prepare(`
-                        SELECT
-                            tm.*,
-                            t1.code AS team1_code, t1.name AS team1_name,
-                            t2.code AS team2_code, t2.name AS team2_name
-                        FROM tournament_matches tm
-                        JOIN teams t1 ON tm.team1_id = t1.id
-                        JOIN teams t2 ON tm.team2_id = t2.id
-                        WHERE tm.id = ?
-                    `);
-                    const { results } = await matchStmt.bind(tournamentMatchId).all<TournamentMatch>();
-
-                    if (!results || results.length === 0) {
-                        return new Response(JSON.stringify({ error: "Tournament match not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                    }
-                    const tournamentMatch = results[0];
-
-                    // Prevent starting if already live or completed
-                    if (tournamentMatch.status === 'live') {
-                         return new Response(JSON.stringify({ error: "Match is already live." }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                    }
-                     if (tournamentMatch.status === 'completed' || tournamentMatch.status === 'archived') { // 'archived' status is from old schema, handle it
-                         return new Response(JSON.stringify({ error: "Match is already completed or archived." }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                    }
-
-                    // 2. Fetch members for each team, ordered by ID
-                    const team1MembersStmt = env.DB.prepare("SELECT * FROM members WHERE team_code = ? ORDER BY id ASC").bind(tournamentMatch.team1_code);
-                    const team2MembersStmt = env.DB.prepare("SELECT * FROM members WHERE team_code = ? ORDER BY id ASC").bind(tournamentMatch.team2_code);
-
-                    const [{ results: team1Members }, { results: team2Members }] = await Promise.all([
-                        team1MembersStmt.all<Member>(),
-                        team2MembersStmt.all<Member>()
-                    ]);
-
-                    if (!team1Members || team1Members.length === 0 || !team2Members || team2Members.length === 0) {
-                         return new Response(JSON.stringify({ error: "One or both teams have no members." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                    }
-                     // Optional: Enforce 3 members per team
-                     if (team1Members.length < 3 || team2Members.length < 3) {
-                          // return new Response(JSON.stringify({ error: "Both teams must have at least 3 members." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-
-                    // 3. Parse player order strings and get the ordered member IDs
-                    const team1PlayerOrderNumbers = parsePlayerOrder(tournamentMatch.team1_player_order);
-                    const team2PlayerOrderNumbers = parsePlayerOrder(tournamentMatch.team2_player_order);
-
-                    // Map 1-based order numbers to actual member IDs from the fetched and sorted member lists
-                    const team1PlayerOrderIds = team1PlayerOrderNumbers
-                        .map(orderNum => team1Members[orderNum - 1]?.id) // Get member ID using 0-based index (orderNum - 1)
-                        .filter((id): id is number => id !== undefined); // Filter out undefined if order number was invalid
-
-                    const team2PlayerOrderIds = team2PlayerOrderNumbers
-                         .map(orderNum => team2Members[orderNum - 1]?.id)
-                         .filter((id): id is number => id !== undefined);
-
-                     // Fallback to default order (by member ID) if parsing failed or resulted in empty arrays
-                     if (team1PlayerOrderIds.length === 0 && team1Members.length > 0) {
-                         console.warn(`Worker: Invalid player order for team1 (${tournamentMatch.team1_code}). Using default order by member ID.`);
-                         team1PlayerOrderIds.push(...team1Members.map(m => m.id)); // Use all member IDs in fetched order
-                     }
-                      if (team2PlayerOrderIds.length === 0 && team2Members.length > 0) {
-                         console.warn(`Worker: Invalid player order for team2 (${tournamentMatch.team2_code}). Using default order by member ID.`);
-                         team2PlayerOrderIds.push(...team2Members.map(m => m.id)); // Use all member IDs in fetched order
-                     }
-
-                     if (team1PlayerOrderIds.length === 0 || team2PlayerOrderIds.length === 0) {
-                          return new Response(JSON.stringify({ error: "Could not determine valid player order for one or both teams. Ensure teams have members and player order is valid (e.g., '1,2,3')." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-
-
-                    // Prepare data for DO initialization
-                    const scheduleDataForDO: MatchScheduleData = { // Use the new type
-                        tournamentMatchId: tournamentMatch.id,
-                        team1_name: tournamentMatch.team1_name || '队伍A', // Provide default names
-                        team2_name: tournamentMatch.team2_name || '队伍B',
-                        team1_members: team1Members, // Pass full member objects
-                        team2_members: team2Members, // Pass full member objects
-                        team1_player_order_ids: team1PlayerOrderIds, // Pass ordered member IDs
-                        team2_player_order_ids: team2PlayerOrderIds, // Pass ordered member IDs
-                        round_name: tournamentMatch.tournament_round, // Pass round name
-                        match_number_in_round: tournamentMatch.match_number_in_round, // Pass match number
-                    };
-
-                    // 4. Get or create Durable Object instance for THIS scheduled match
-                    // Use tournamentMatchId to derive the DO ID
-                    const matchDOId = env.MATCH_DO.idFromName(tournamentMatchId.toString());
-                    const matchStub = env.MATCH_DO.get(matchDOId);
-
-
-                    // Call the DO's internal initialization endpoint
-                    const initResponse = await matchStub.fetch(new Request(url.origin + `/internal/initialize-from-schedule`, { // Use internal path
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(scheduleDataForDO),
-                    }));
-
-                    const initResult = await initResponse.json();
-
-                    if (!initResponse.ok || !initResult.success) {
-                        console.error("DO initialization failed:", initResult.message);
-                        return new Response(JSON.stringify({ error: "Failed to initialize live match in DO", details: initResult.message }), { status: initResponse.status });
-                    }
-
-                    // 5. Update the tournament_matches entry in D1
-                    const updateStmt = env.DB.prepare("UPDATE tournament_matches SET status = ?, match_do_id = ? WHERE id = ?");
-                    // Use the newly created matchDOId.toString()
-                    const updateResult = await updateStmt.bind('live', matchDOId.toString(), tournamentMatchId).run();
-
-                    if (!updateResult.success) {
-                         console.error(`Worker failed to update tournament_matches entry ${tournamentMatchId} status to 'live':`, updateResult.error);
-                         // This is a partial failure. The DO is initialized, but the D1 schedule isn't updated.
-                         // Decide how to handle this. For now, return success based on DO init, but log the D1 error.
-                         // A more robust system might require rollback or manual intervention.
-                    } else {
-                         console.log(`Worker updated tournament_matches entry ${tournamentMatchId} status to 'live' and linked DO ID.`);
-                    }
-
-                    // Return the newly created matchDOId
-                    return new Response(JSON.stringify({ success: true, message: "Live match started from schedule.", matchDOId: matchDOId.toString(), tournamentMatchId: tournamentMatch.id }), { headers: { 'Content-Type': 'application/json' } });
-
-                } catch (e: any) {
-                    console.error("Worker exception during start_live:", e.stack); // Use e.stack
-                    return new Response(JSON.stringify({ error: `Exception starting live match: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-                }
+             } else {
+                 response = errorResponse("Invalid tournament match ID", 400);
              }
         }
 
-        // --- Bulk Import Tournament Matches Endpoint ---
-         if (url.pathname === '/api/tournament_matches/bulk' && request.method === 'POST') {
-            try {
-                const matchesData = await request.json<BulkTournamentMatchRow[]>(); // Use the specific bulk type
-                if (!Array.isArray(matchesData)) {
-                     return new Response(JSON.stringify({ error: "Invalid payload: Expected an array of tournament matches." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        // --- API Endpoints for Live Matches (forwarded to DO) ---
+        // These paths have the structure /api/live-match/:doIdString/...
+        else if (pathname.startsWith('/api/live-match/')) {
+            const parts = pathname.split('/');
+            const doIdString = parts[3]; // e.g., /api/live-match/some-id/state -> parts = ["", "api", "live-match", "some-id", "state"]
+            const action = parts[4]; // e.g., "state", "websocket", "calculate_round", etc.
+
+            if (parts.length >= 4 && doIdString) {
+                switch (action) {
+                    case 'state':
+                        if (method === 'GET' && parts.length === 5) {
+                            // Forward GET /api/live-match/:doIdString/state to DO's internal /state
+                            response = await forwardRequestToDO(doIdString, env, request, '/state', 'GET');
+                        } else {
+                            response = new Response("Method not allowed for /state", { status: 405 });
+                        }
+                        break;
+                    case 'websocket':
+                        if (method === 'GET' && parts.length === 5) {
+                             // Forward WebSocket upgrade request to DO's internal /websocket
+                             const doStub = getMatchDO(doIdString, env);
+                             // The DO's fetch method will handle the 'Upgrade: websocket' header.
+                             // Use the original request URL to preserve headers needed for upgrade.
+                             const doUrl = new URL(request.url);
+                             doUrl.pathname = '/websocket'; // Internal path for WS
+                             response = await doStub.fetch(doUrl.toString(), request); // Forward the original request
+                        } else {
+                            response = new Response("Method not allowed for /websocket", { status: 405 });
+                        }
+                        break;
+                    case 'calculate_round':
+                        if (method === 'POST' && parts.length === 5) {
+                            try {
+                                const payload: CalculateRoundPayload = await request.json();
+                                // Basic payload validation (percentages are numbers)
+                                if (typeof payload.teamA_percentage !== 'number' || typeof payload.teamB_percentage !== 'number') {
+                                     return errorResponse("Invalid payload: teamA_percentage and teamB_percentage must be numbers.", 400);
+                                }
+                                // Forward POST /api/live-match/:doIdString/calculate_round to DO's internal /internal/calculate-round
+                                response = await forwardRequestToDO(doIdString, env, request, '/internal/calculate-round', 'POST', payload);
+                            } catch (e: any) {
+                                console.error(`Worker: Exception processing calculate_round payload for DO ${doIdString}:`, e);
+                                response = errorResponse(`Invalid payload format: ${e.message}`, 400);
+                            }
+                        } else {
+                            response = new Response("Method not allowed for /calculate_round", { status: 405 });
+                        }
+                        break;
+                    case 'next_round':
+                        if (method === 'POST' && parts.length === 5) {
+                            // Forward POST /api/live-match/:doIdString/next_round to DO's internal /internal/next-round
+                            response = await forwardRequestToDO(doIdString, env, request, '/internal/next-round', 'POST');
+                        } else {
+                            response = new Response("Method not allowed for /next_round", { status: 405 });
+                        }
+                        break;
+                    case 'archive':
+                         if (method === 'POST' && parts.length === 5) {
+                             // Forward POST /api/live-match/:doIdString/archive to DO's internal /internal/archive-match
+                             response = await forwardRequestToDO(doIdString, env, request, '/internal/archive-match', 'POST');
+                         } else {
+                             response = new Response("Method not allowed for /archive", { status: 405 });
+                         }
+                         break;
+                    case 'resolve_draw':
+                         if (method === 'POST' && parts.length === 5) {
+                             try {
+                                 const payload: ResolveDrawPayload = await request.json();
+                                 // Basic payload validation
+                                 if (payload.winner !== 'teamA' && payload.winner !== 'teamB') {
+                                      return errorResponse("Invalid payload: winner must be 'teamA' or 'teamB'.", 400);
+                                 }
+                                 // Forward POST /api/live-match/:doIdString/resolve_draw to DO's internal /internal/resolve-draw
+                                 response = await forwardRequestToDO(doIdString, env, request, '/internal/resolve-draw', 'POST', payload);
+                             } catch (e: any) {
+                                 console.error(`Worker: Exception processing resolve_draw payload for DO ${doIdString}:`, e);
+                                 response = errorResponse(`Invalid payload format: ${e.message}`, 400);
+                             }
+                         } else {
+                             response = new Response("Method not allowed for /resolve_draw", { status: 405 });
+                         }
+                         break;
+                    case 'select_tiebreaker_song': // New endpoint for Staff to select tiebreaker
+                         if (method === 'POST' && parts.length === 5) {
+                             // TODO: Add authentication/authorization check (Staff only)
+                             try {
+                                 const payload: SelectTiebreakerSongPayload = await request.json();
+                                 if (typeof payload.song_id !== 'number' || typeof payload.selected_difficulty !== 'string') {
+                                     return errorResponse("Invalid payload: song_id (number) and selected_difficulty (string) are required.", 400);
+                                 }
+                                 // Forward POST /api/live-match/:doIdString/select_tiebreaker_song to DO's internal /internal/select-tiebreaker-song
+                                 response = await forwardRequestToDO(doIdString, env, request, '/internal/select-tiebreaker-song', 'POST', payload);
+                             } catch (e: any) {
+                                 console.error(`Worker: Exception processing select_tiebreaker_song payload for DO ${doIdString}:`, e);
+                                 response = errorResponse(`Invalid payload format: ${e.message}`, 400);
+                             }
+                         } else {
+                             response = new Response("Method not allowed for /select_tiebreaker_song", { status: 405 });
+                         }
+                         break;
+                    // Add other live match actions here
+                    default:
+                        response = new Response("Not Found.", { status: 404 });
+                        break;
                 }
-
-                // Basic validation for each row and collect team IDs
-                const teamIds = new Set<number>();
-                const roundMatchNumbers = new Set<string>(); // To check for duplicates in input
-                for (const match of matchesData) {
-                     // Validate required fields and types from CSV strings
-                     const matchNumber = parseInt(match.match_number_in_round, 10);
-                     const team1Id = parseInt(match.team1_id, 10);
-                     const team2Id = parseInt(match.team2_id, 10);
-
-                     if (!match.tournament_round || isNaN(matchNumber) || matchNumber < 1 || isNaN(team1Id) || isNaN(team2Id)) {
-                          return new Response(JSON.stringify({ error: `Invalid match data found in input: round='${match.tournament_round}', number='${match.match_number_in_round}', team1_id='${match.team1_id}', team2_id='${match.team2_id}'. Round, number (>=1), team1_id, team2_id are required and must be valid numbers.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     if (team1Id === team2Id) {
-                          return new Response(JSON.stringify({ error: `Invalid match data found in input: Teams cannot be the same for round='${match.tournament_round}', number='${match.match_number_in_round}'.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     const key = `${match.tournament_round}-${matchNumber}`;
-                     if (roundMatchNumbers.has(key)) {
-                          return new Response(JSON.stringify({ error: `Duplicate match found in input data: Round '${match.tournament_round}', Number ${matchNumber}.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                     roundMatchNumbers.add(key);
-
-                     teamIds.add(team1Id);
-                     teamIds.add(team2Id);
-                }
-
-                // Check if all team IDs exist in the database
-                if (teamIds.size > 0) {
-                     const teamIdArray = Array.from(teamIds);
-                     const existingTeamsStmt = env.DB.prepare(`SELECT id FROM teams WHERE id IN (${teamIdArray.map(() => '?').join(',')})`).bind(...teamIdArray);
-                     const { results: existingTeams } = await existingTeamsStmt.all<{ id: number }>();
-                     const existingTeamIds = new Set(existingTeams?.map(t => t.id) || []);
-
-                     const invalidTeamIds = teamIdArray.filter(id => !existingTeamIds.has(id));
-                     if (invalidTeamIds.length > 0) {
-                          return new Response(JSON.stringify({ error: `Bulk import failed: Team IDs not found: ${invalidTeamIds.join(', ')}. Please ensure teams exist before importing matches.` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                     }
-                }
-
-                 // Check for existing round+number combinations in the database
-                 if (roundMatchNumbers.size > 0) {
-                     const existingMatchesStmt = env.DB.prepare(`SELECT tournament_round, match_number_in_round FROM tournament_matches WHERE ${Array.from(roundMatchNumbers).map(() => "(tournament_round = ? AND match_number_in_round = ?)").join(" OR ")}`);
-                     const bindParams: (string | number)[] = [];
-                     Array.from(roundMatchNumbers).forEach(key => {
-                         const [round, number] = key.split('-');
-                         bindParams.push(round, parseInt(number, 10));
-                     });
-                     const { results: existingMatches } = await existingMatchesStmt.all<{ tournament_round: string, match_number_in_round: number }>();
-                     const existingMatchKeys = new Set(existingMatches?.map(m => `${m.tournament_round}-${m.match_number_in_round}`) || []);
-
-                     if (existingMatchKeys.size > 0) {
-                          return new Response(JSON.stringify({ error: `Bulk import failed: Matches already exist: ${Array.from(existingMatchKeys).join(', ')}. Please remove existing matches or update them individually.` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-                     }
-                 }
-
-
-                const stmt = env.DB.prepare("INSERT INTO tournament_matches (tournament_round, match_number_in_round, team1_id, team2_id, team1_player_order, team2_player_order, scheduled_time, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                const now = new Date().toISOString();
-                const insertBatch = matchesData.map(match => {
-                     const matchNumber = parseInt(match.match_number_in_round, 10);
-                     const team1Id = parseInt(match.team1_id, 10);
-                     const team2Id = parseInt(match.team2_id, 10);
-                     // Validate scheduled_time format if necessary, or just store as provided string
-                     const scheduledTime = match.scheduled_time || null;
-
-                     return stmt.bind(
-                         match.tournament_round,
-                         matchNumber,
-                         team1Id,
-                         team2Id,
-                         match.team1_player_order || null,
-                         match.team2_player_order || null,
-                         scheduledTime,
-                         now,
-                         'scheduled' // Default status for bulk import
-                     );
-                });
-
-                // Use batch for efficiency
-                const results = await env.DB.batch(insertBatch);
-
-                // Check results for errors (batch might succeed partially)
-                const errors = results.filter(r => !r.success);
-                const successCount = results.length - errors.length;
-
-                if (errors.length > 0) {
-                     console.error("D1 bulk create tournament matches errors:", errors);
-                     return new Response(JSON.stringify({
-                         success: successCount > 0, // Consider success if at least one row inserted
-                         message: `Bulk import completed with errors. Successfully imported ${successCount} matches. Failed to import ${errors.length} matches.`,
-                         errors: errors.map(e => e.error)
-                     }), { status: successCount > 0 ? 207 : 500, headers: { 'Content-Type': 'application/json' } }); // 207 Multi-Status
-                }
-
-                return new Response(JSON.stringify({ success: true, message: `Bulk import successful. ${successCount} matches imported.` }), { status: 201, headers: { 'Content-Type': 'application/json' } });
-
-            } catch (e: any) {
-                console.error("Worker exception during bulk create tournament matches:", e.stack); // Use e.stack
-                return new Response(JSON.stringify({ error: `Exception during bulk import tournament matches: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            } else {
+                 response = new Response("Invalid live match path format", { status: 400 });
             }
         }
 
-        // --- Archived Rounds Endpoints ---
-        // Handles GET /api/archived_rounds?match_do_id={doIdString} (Existing)
-        // Handles GET /api/archived_rounds/{doIdString} (New)
-        if (url.pathname === '/api/archived_rounds' && request.method === 'GET') {
-            try {
-                const matchDoId = url.searchParams.get('match_do_id');
-                if (!matchDoId) {
-                    // If no query param, check if it's the path param format
-                    // This check is redundant here because we are in the /api/archived_rounds path,
-                    // but the next else if handles the path param specifically.
-                    // This block is strictly for the query param version.
-                     return new Response(JSON.stringify({ error: "match_do_id query parameter is required for this endpoint format." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-                }
-                const stmt = env.DB.prepare("SELECT * FROM round_archives WHERE match_do_id = ? ORDER BY round_number ASC").bind(matchDoId);
-                const { results } = await stmt.all<RoundArchive>();
-                return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
-            } catch (e: any) {
-                console.error("D1 get archived rounds (query param) error:", e.stack);
-                return new Response(JSON.stringify({ error: "Failed to retrieve archived rounds", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-            }
-        } else if (url.pathname.startsWith('/api/archived_rounds/') && request.method === 'GET') {
-             // New handler for path parameter format: /api/archived_rounds/{doIdString}
-             const pathParts = url.pathname.split('/'); // Expected: ['', 'api', 'archived_rounds', 'DO_ID_STRING']
-             if (pathParts.length !== 4) {
-                 return new Response(JSON.stringify({ error: 'Invalid archived rounds path structure.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-             const matchDoId = pathParts[3]; // Extract the DO ID string
-
-             if (!matchDoId) {
-                 return new Response(JSON.stringify({ error: 'Match Durable Object ID string missing in path.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-
+        // --- Match History Endpoint ---
+        // GET /api/match_history
+        else if (method === 'GET' && pathname === '/api/match_history') {
              try {
-                 // Query D1 directly using the DO ID string
-                 const stmt = env.DB.prepare("SELECT * FROM round_archives WHERE match_do_id = ? ORDER BY round_number ASC").bind(matchDoId);
-                 const { results } = await stmt.all<RoundArchive>();
-                 return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
+                 // Fetch completed/archived matches from tournament_matches
+                 const matchesQuery = `
+                     SELECT
+                         tm.id,
+                         tm.round_name,
+                         tm.scheduled_time,
+                         tm.status,
+                         tm.final_score_team1,
+                         tm.final_score_team2,
+                         t1.name AS team1_name,
+                         t2.name AS team2_name,
+                         tw.name AS winner_team_name
+                     FROM tournament_matches tm
+                     JOIN teams t1 ON tm.team1_id = t1.id
+                     JOIN teams t2 ON tm.team2_id = t2.id
+                     LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+                     WHERE tm.status IN ('completed', 'archived')
+                     ORDER BY tm.scheduled_time DESC, tm.created_at DESC;
+                 `;
+                 const { results: matches } = await env.DB.prepare(matchesQuery).all<TournamentMatch>();
+
+                 // For each match, fetch its round history
+                 const historyPromises = matches.map(async match => {
+                     const roundsQuery = `
+                         SELECT
+                             mrh.*,
+                             s.title AS song_title,
+                             s.cover_filename AS cover_filename,
+                             t_picker.name AS picker_team_name,
+                             m_picker.nickname AS picker_member_nickname,
+                             m1.nickname AS team1_member_nickname,
+                             m2.nickname AS team2_member_nickname
+                         FROM match_rounds_history mrh
+                         LEFT JOIN songs s ON mrh.song_id = s.id
+                         LEFT JOIN teams t_picker ON mrh.picker_team_id = t_picker.id
+                         LEFT JOIN members m_picker ON mrh.picker_member_id = m_picker.id
+                         LEFT JOIN members m1 ON mrh.team1_member_id = m1.id
+                         LEFT JOIN members m2 ON mrh.team2_member_id = m2.id
+                         WHERE mrh.tournament_match_id = ?
+                         ORDER BY mrh.round_number_in_match ASC;
+                     `;
+                     const { results: rounds } = await env.DB.prepare(roundsQuery).bind(match.id).all<any>(); // Use 'any' or a specific history round type
+
+                     // Parse round_summary_json for each round
+                     const roundsWithParsedSummary = rounds.map(round => ({
+                         ...round,
+                         round_summary: round.round_summary_json ? JSON.parse(round.round_summary_json) : null,
+                         // Optional: Construct fullCoverUrl for song in history
+                         fullCoverUrl: round.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${round.cover_filename}` : undefined,
+                         // Remove raw JSON field
+                         // round_summary_json: undefined,
+                     }));
+
+                     return {
+                         ...match,
+                         rounds: roundsWithParsedSummary,
+                     };
+                 });
+
+                 const matchHistory = await Promise.all(historyPromises);
+
+                 response = jsonResponse(matchHistory);
+
              } catch (e: any) {
-                 console.error("D1 get archived rounds (path param) error:", e.stack);
-                 return new Response(JSON.stringify({ error: "Failed to retrieve archived rounds", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                 console.error("Worker: Failed to fetch match history:", e);
+                 response = errorResponse(e.message);
              }
         }
 
 
-        // --- Archived Matches Endpoints ---
-        // Example: GET /api/archived_matches
-        // Example: GET /api/archived_matches/{doIdString}
-        if (url.pathname === '/api/archived_matches' && request.method === 'GET') {
-             try {
-                 const stmt = env.DB.prepare("SELECT * FROM matches_archive ORDER BY archived_at DESC");
-                 const { results } = await stmt.all<MatchArchiveSummary>();
-                 return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
-             } catch (e: any) {
-                 console.error("D1 get archived matches error:", e.stack);
-                 return new Response(JSON.stringify({ error: "Failed to retrieve archived matches", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-             }
-        } else if (url.pathname.startsWith('/api/archived_matches/') && request.method === 'GET') {
-             const pathParts = url.pathname.split('/');
-             const matchDoId = pathParts[3]; // e.g., /api/archived_matches/{doIdString}
-
-             if (!matchDoId) {
-                 return new Response(JSON.stringify({ error: "Match DO ID missing in path." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-             }
-
-             try {
-                 const stmt = env.DB.prepare("SELECT * FROM matches_archive WHERE match_do_id = ?").bind(matchDoId);
-                 const { results } = await stmt.all<MatchArchiveSummary>();
-                 if (results && results.length > 0) {
-                     return new Response(JSON.stringify(results[0]), { headers: { 'Content-Type': 'application/json' } });
-                 } else {
-                     return new Response(JSON.stringify({ error: "Archived match not found." }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-                 }
-             } catch (e: any) {
-                 console.error("D1 get single archived match error:", e.stack);
-                 return new Response(JSON.stringify({ error: "Failed to retrieve archived match", details: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-             }
+        // --- Fallback for unmatched routes ---
+        else {
+            response = new Response('Not Found.', { status: 404 });
         }
 
-
-        // --- Fallback for /api/ paths that didn't match any specific endpoint ---
-        return new Response(JSON.stringify({ error: 'API Endpoint Not Found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-
-    } else {
-        // --- Handle non-/api/ paths (e.g., serving static assets, or a different entry point) ---
-        // For this example, we'll just return a generic Not Found for non-/api/ paths
-        // You might have other logic here for your frontend or other routes.
-        console.warn(`Unhandled non-/api/ path: ${url.pathname}`);
-        return new Response('Not Found', { status: 404 });
-    }
-  }
+        // Add CORS headers to the response
+        for (const [key, value] of Object.entries(corsHeaders)) {
+            response.headers.set(key, value);
+        }
+        return response;
+    },
 };
+
+// Make the Durable Object class available
+export { MatchDO };
