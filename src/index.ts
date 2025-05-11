@@ -1,23 +1,24 @@
 // src/index.ts
 import type {
     Env,
-    Team, // Keep Team type
-    Member, // Keep Member type
-    TournamentMatch, // Updated TournamentMatch type
-    CreateTournamentMatchPayload, // Keep CreateTournamentMatchPayload
-    MatchState, // Updated MatchState type
-    CalculateRoundPayload, // Updated CalculateRoundPayload
-    ResolveDrawPayload, // Keep ResolveDrawPayload
-    MatchScheduleData, // Updated MatchScheduleData
-    MemberSongPreference, // New MemberSongPreference type
-    Song, // New Song type
-    SongFromR2, // New SongFromR2 type
-    R2SongList, // New R2SongList type
-    MatchSong, // New MatchSong type
-    SelectTiebreakerSongPayload, // New SelectTiebreakerSongPayload
-    RoundSummary // New RoundSummary type
+    Team,
+    Member,
+    TournamentMatch,
+    // CreateTournamentMatchPayload, // This is the simplified one now
+    MatchState,
+    CalculateRoundPayload,
+    ResolveDrawPayload,
+    MatchScheduleData,
+    MemberSongPreference,
+    Song,
+    // ImportSongsPayload, // REMOVED: No longer importing via API
+    MatchSong,
+    SelectTiebreakerSongPayload,
+    RoundSummary,
+    SongLevel,
+    // ImportedSongItem // REMOVED: No longer importing via API
 } from './types';
-import { MatchDO } from './durable-objects/matchDo'; // Import the DO class
+import { MatchDO } from './durable-objects/matchDo';
 
 // Helper to get a DO instance by ID string
 const getMatchDO = (doIdString: string, env: Env): DurableObjectStub => {
@@ -29,28 +30,23 @@ const getMatchDO = (doIdString: string, env: Env): DurableObjectStub => {
 const forwardRequestToDO = async (doIdString: string, env: Env, request: Request, internalPath: string, method: string = 'POST', body?: any): Promise<Response> => {
     try {
         const doStub = getMatchDO(doIdString, env);
-        // Use a dummy URL with the correct origin/protocol for the DO fetch
-        // The actual path is set in internalPath
         const doUrl = new URL(`https://${request.headers.get('Host') || 'dummy-host'}`);
         doUrl.pathname = internalPath;
 
         const doRequest = new Request(doUrl.toString(), {
             method: method,
-            headers: request.headers, // Keep original headers like Authorization, Content-Type
-            body: body ? JSON.stringify(body) : request.body, // Stringify body if provided
+            headers: request.headers,
+            body: body ? JSON.stringify(body) : request.body,
             redirect: 'follow',
         });
 
-        // Remove headers that might cause issues or are irrelevant for internal DO fetch
-        doRequest.headers.delete('Host'); // Cloudflare handles Host for DOs
-        // doRequest.headers.delete('Origin'); // Usually not needed for internal paths
+        doRequest.headers.delete('Host');
 
         const response = await doStub.fetch(doRequest);
         return response;
 
     } catch (e: any) {
         console.error(`Worker: Failed to forward request to DO ${doIdString} for path ${internalPath}:`, e);
-        // Return a structured error response
         return new Response(JSON.stringify({ success: false, error: `Failed to communicate with match instance: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
 };
@@ -78,9 +74,8 @@ export default {
         const method = request.method;
         const pathname = url.pathname;
 
-        // Apply CORS headers to all responses (adjust as needed for your frontend origin)
         const corsHeaders = {
-            'Access-Control-Allow-Origin': '*', // Replace with your frontend origin in production
+            'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         };
@@ -99,15 +94,14 @@ export default {
         // GET /api/teams
         if (method === 'GET' && pathname === '/api/teams') {
             try {
-                // Assuming Team type now matches D1 structure with number id
                 const { results } = await env.DB.prepare("SELECT * FROM teams").all<Team>();
-                response = jsonResponse(results); // Wrap in ApiResponse
+                response = jsonResponse(results);
             } catch (e: any) {
                 console.error("Worker: Failed to list teams:", e);
                 response = errorResponse(e.message);
             }
         }
-        // GET /api/teams/:id (Using ID now instead of code)
+        // GET /api/teams/:id
         else if (method === 'GET' && pathname.match(/^\/api\/teams\/\d+$/)) {
              const parts = pathname.split('/');
              const teamId = parseInt(parts[3], 10);
@@ -130,8 +124,7 @@ export default {
         // GET /api/members
         else if (method === 'GET' && pathname === '/api/members') {
             try {
-                // Assuming Member type now matches D1 structure with number id and team_code
-                const teamCode = url.searchParams.get('team_code'); // Still filter by team_code
+                const teamCode = url.searchParams.get('team_code');
                 let query = "SELECT * FROM members";
                 let params: string[] = [];
                 if (teamCode) {
@@ -139,7 +132,7 @@ export default {
                     params.push(teamCode);
                 }
                 const { results } = await env.DB.prepare(query).bind(...params).all<Member>();
-                response = jsonResponse(results); // Wrap in ApiResponse
+                response = jsonResponse(results);
             } catch (e: any) {
                 console.error("Worker: Failed to list members:", e);
                 response = errorResponse(e.message);
@@ -166,19 +159,44 @@ export default {
              }
         }
 
-        // --- New Song Endpoints ---
+        // --- Song Endpoints ---
+
+        // REMOVED: POST /admin/import_songs endpoint
 
         // GET /api/songs (Get songs from D1, supports filtering/search)
         else if (method === 'GET' && pathname === '/api/songs') {
             try {
-                // Implement filtering/search based on query parameters (e.g., ?category=...&search=...)
-                // For simplicity, fetching all for now
-                const { results } = await env.DB.prepare("SELECT * FROM songs").all<Song>();
+                let query = "SELECT * FROM songs WHERE 1=1";
+                const params: (string | number)[] = [];
 
-                // Optional: Parse levels_json and construct fullCoverUrl for each song
+                const category = url.searchParams.get('category');
+                if (category) {
+                    query += " AND category = ?";
+                    params.push(category);
+                }
+                const type = url.searchParams.get('type');
+                 if (type) {
+                     query += " AND type = ?";
+                     params.push(type);
+                 }
+                 const search = url.searchParams.get('search');
+                 if (search) {
+                     query += " AND title LIKE ?";
+                     params.push(`%${search}%`);
+                 }
+                 // TODO: Add filtering by level (requires parsing levels_json or querying based on its content)
+
+                 query += " ORDER BY title ASC";
+
+                const { results } = await env.DB.prepare(query).bind(...params).all<Song>();
+
+                // Parse levels_json and construct fullCoverUrl for each song
                 const songsWithDetails = results.map(song => {
-                    const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) : undefined;
-                    const fullCoverUrl = song.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${song.cover_filename}` : undefined; // Assuming SONG_COVER_BUCKET binding
+                    const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) as SongLevel : undefined;
+                    // Assuming SONG_COVER_BUCKET binding exists and covers are public or served via Worker
+                    // Use .r2.dev public access or your custom domain
+                    const fullCoverUrl = song.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}.r2.dev/${song.cover_filename}` : undefined;
+
                     return { ...song, parsedLevels, fullCoverUrl };
                 });
 
@@ -187,64 +205,6 @@ export default {
                 console.error("Worker: Failed to list songs:", e);
                 response = errorResponse(e.message);
             }
-        }
-
-        // POST /admin/sync_songs_from_r2 (Admin endpoint to sync songs from R2 JSON)
-        // This should ideally be protected by authentication/authorization
-        else if (method === 'POST' && pathname === '/admin/sync_songs_from_r2') {
-             // TODO: Add authentication/authorization check here
-
-             try {
-                 // 1. Fetch JSON from R2
-                 const object = await env.SONG_JSON_BUCKET.get(env.SONG_JSON_KEY); // Assuming SONG_JSON_KEY binding
-                 if (!object) {
-                     return errorResponse(`Song JSON file not found in R2 at key: ${env.SONG_JSON_KEY}`, 404);
-                 }
-                 const songListData: R2SongList = await object.json();
-
-                 // 2. Check version (optional but recommended)
-                 // const currentVersion = await env.DB.prepare("SELECT value FROM settings WHERE key = 'song_data_version'").first<{ value: string }>();
-                 // if (currentVersion && currentVersion.value === songListData.data) {
-                 //     console.log("Worker: Song data version is the same. Skipping sync.");
-                 //     return jsonResponse({ message: "Song data is already up to date." });
-                 // }
-
-                 // 3. Clear existing songs table (or perform upsert logic)
-                 // Clearing is simpler for initial setup, upsert is better for updates
-                 await env.DB.prepare("DELETE FROM songs").run();
-                 console.log("Worker: Cleared existing songs table.");
-
-                 // 4. Insert new songs
-                 const insertStmt = env.DB.prepare(
-                     `INSERT INTO songs (title, category, bpm, levels_json, type, cover_filename, source_data_version)
-                      VALUES (?, ?, ?, ?, ?, ?, ?)`
-                 );
-
-                 const songsToInsert = songListData.曲目列表.map(song => ({
-                     title: song.曲名,
-                     category: song.分类,
-                     bpm: song.BPM,
-                     levels_json: JSON.stringify(song.等级),
-                     type: song.类型,
-                     cover_filename: song.封面,
-                     source_data_version: songListData.data,
-                 }));
-
-                 // D1 batch insertion
-                 const insertResults = await env.DB.batch(songsToInsert.map(song => insertStmt.bind(
-                     song.title, song.category, song.bpm, song.levels_json, song.type, song.cover_filename, song.source_data_version
-                 )));
-
-                 // 5. Update version setting (optional)
-                 // await env.DB.prepare("REPLACE INTO settings (key, value) VALUES ('song_data_version', ?)").bind(songListData.data).run();
-
-                 console.log(`Worker: Synced ${insertResults.length} songs from R2.`);
-                 response = jsonResponse({ success: true, message: `Successfully synced ${insertResults.length} songs.` });
-
-             } catch (e: any) {
-                 console.error("Worker: Failed to sync songs from R2:", e);
-                 response = errorResponse(`Failed to sync songs: ${e.message}`);
-             }
         }
 
 
@@ -261,12 +221,18 @@ export default {
                  }
 
                  // Optional: Validate member_id, song_id exist in DB
+                 const memberExists = await env.DB.prepare("SELECT id FROM members WHERE id = ?").bind(payload.member_id).first();
+                 const songExists = await env.DB.prepare("SELECT id FROM songs WHERE id = ?").bind(payload.song_id).first();
+                 if (!memberExists || !songExists) {
+                      return errorResponse("Invalid member_id or song_id.", 400);
+                 }
 
                  const stmt = env.DB.prepare(
                      `INSERT INTO member_song_preferences (member_id, tournament_stage, song_id, selected_difficulty, created_at)
                       VALUES (?, ?, ?, ?, ?)
                       ON CONFLICT(member_id, tournament_stage, song_id, selected_difficulty) DO UPDATE SET
-                          created_at = excluded.created_at -- Simple update on conflict
+                          selected_difficulty = excluded.selected_difficulty, -- Allow updating difficulty
+                          created_at = excluded.created_at -- Update timestamp
                      `
                  );
 
@@ -279,8 +245,26 @@ export default {
                  ).run();
 
                  if (result.success) {
-                     // Fetch the inserted/updated preference to return
-                     const newPreference = await env.DB.prepare("SELECT * FROM member_song_preferences WHERE id = ?").bind(result.meta.last_row_id).first<MemberSongPreference>();
+                     // Fetch the inserted/updated preference to return, including song details
+                     const newPreferenceQuery = `
+                         SELECT
+                             msp.*,
+                             s.title AS song_title,
+                             s.cover_filename AS cover_filename,
+                             s.levels_json AS levels_json
+                         FROM member_song_preferences msp
+                         JOIN songs s ON msp.song_id = s.id
+                         WHERE msp.id = ?`;
+                     const newPreference = await env.DB.prepare(newPreferenceQuery).bind(result.meta.last_row_id).first<MemberSongPreference & { levels_json: string | null }>();
+
+                     // Add parsed levels and full cover URL
+                     if (newPreference) {
+                          (newPreference as MemberSongPreference).parsedLevels = newPreference.levels_json ? JSON.parse(newPreference.levels_json) : undefined;
+                          (newPreference as MemberSongPreference).fullCoverUrl = newPreference.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}.r2.dev/${newPreference.cover_filename}` : undefined;
+                          delete (newPreference as any).levels_json; // Remove raw json field
+                     }
+
+
                      response = jsonResponse(newPreference, 201);
                  } else {
                      console.error("Worker: Failed to save member song preference:", result.error);
@@ -323,10 +307,10 @@ export default {
 
                  const { results } = await env.DB.prepare(query).bind(memberIdNum, stage).all<MemberSongPreference & { levels_json: string | null }>();
 
-                 // Optional: Parse levels_json and construct fullCoverUrl for each preference
+                 // Parse levels_json and construct fullCoverUrl for each preference
                  const preferencesWithDetails = results.map(pref => {
-                     const parsedLevels = pref.levels_json ? JSON.parse(pref.levels_json) : undefined;
-                     const fullCoverUrl = pref.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${pref.cover_filename}` : undefined; // Assuming SONG_COVER_BUCKET binding
+                     const parsedLevels = pref.levels_json ? JSON.parse(pref.levels_json) as SongLevel : undefined;
+                     const fullCoverUrl = pref.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}.r2.dev/${pref.cover_filename}` : undefined; // Assuming SONG_COVER_BUCKET binding
                      // Remove levels_json from the final object if you don't want to expose it directly
                      const { levels_json, ...rest } = pref;
                      return { ...rest, parsedLevels, fullCoverUrl };
@@ -367,9 +351,9 @@ export default {
                 // Parse JSON fields before returning
                 const matchesWithParsedData = results.map(match => ({
                     ...match,
-                    team1_player_order: match.team1_player_order_json ? JSON.parse(match.team1_player_order_json) : null,
-                    team2_player_order: match.team2_player_order_json ? JSON.parse(match.team2_player_order_json) : null,
-                    match_song_list: match.match_song_list_json ? JSON.parse(match.match_song_list_json) : null,
+                    team1_player_order: match.team1_player_order_json ? JSON.parse(match.team1_player_order_json) as number[] : null,
+                    team2_player_order: match.team2_player_order_json ? JSON.parse(match.team2_player_order_json) as number[] : null,
+                    match_song_list: match.match_song_list_json ? JSON.parse(match.match_song_list_json) as MatchSong[] : null,
                     // Remove raw JSON fields if not needed by frontend
                     // team1_player_order_json: undefined,
                     // team2_player_order_json: undefined,
@@ -598,8 +582,6 @@ export default {
                               response = jsonResponse({ message: "Match started live.", match_do_id: doIdString, do_init_result: doResult });
                          } else {
                               console.error(`Worker: Failed to update tournament_matches status for ${tournamentMatchId}:`, updateResult.error);
-                              // Decide how to handle this - DO is initialized, but schedule not updated.
-                              // For now, return error but DO is likely fine.
                               response = errorResponse(`Match started live in DO, but failed to update schedule status: ${updateResult.error}`, 500);
                          }
                      } else {
@@ -629,7 +611,6 @@ export default {
                 switch (action) {
                     case 'state':
                         if (method === 'GET' && parts.length === 5) {
-                            // Forward GET /api/live-match/:doIdString/state to DO's internal /state
                             response = await forwardRequestToDO(doIdString, env, request, '/state', 'GET');
                         } else {
                             response = new Response("Method not allowed for /state", { status: 405 });
@@ -637,13 +618,10 @@ export default {
                         break;
                     case 'websocket':
                         if (method === 'GET' && parts.length === 5) {
-                             // Forward WebSocket upgrade request to DO's internal /websocket
                              const doStub = getMatchDO(doIdString, env);
-                             // The DO's fetch method will handle the 'Upgrade: websocket' header.
-                             // Use the original request URL to preserve headers needed for upgrade.
                              const doUrl = new URL(request.url);
-                             doUrl.pathname = '/websocket'; // Internal path for WS
-                             response = await doStub.fetch(doUrl.toString(), request); // Forward the original request
+                             doUrl.pathname = '/websocket';
+                             response = await doStub.fetch(doUrl.toString(), request);
                         } else {
                             response = new Response("Method not allowed for /websocket", { status: 405 });
                         }
@@ -652,11 +630,9 @@ export default {
                         if (method === 'POST' && parts.length === 5) {
                             try {
                                 const payload: CalculateRoundPayload = await request.json();
-                                // Basic payload validation (percentages are numbers)
                                 if (typeof payload.teamA_percentage !== 'number' || typeof payload.teamB_percentage !== 'number') {
                                      return errorResponse("Invalid payload: teamA_percentage and teamB_percentage must be numbers.", 400);
                                 }
-                                // Forward POST /api/live-match/:doIdString/calculate_round to DO's internal /internal/calculate-round
                                 response = await forwardRequestToDO(doIdString, env, request, '/internal/calculate-round', 'POST', payload);
                             } catch (e: any) {
                                 console.error(`Worker: Exception processing calculate_round payload for DO ${doIdString}:`, e);
@@ -668,7 +644,6 @@ export default {
                         break;
                     case 'next_round':
                         if (method === 'POST' && parts.length === 5) {
-                            // Forward POST /api/live-match/:doIdString/next_round to DO's internal /internal/next-round
                             response = await forwardRequestToDO(doIdString, env, request, '/internal/next-round', 'POST');
                         } else {
                             response = new Response("Method not allowed for /next_round", { status: 405 });
@@ -676,7 +651,6 @@ export default {
                         break;
                     case 'archive':
                          if (method === 'POST' && parts.length === 5) {
-                             // Forward POST /api/live-match/:doIdString/archive to DO's internal /internal/archive-match
                              response = await forwardRequestToDO(doIdString, env, request, '/internal/archive-match', 'POST');
                          } else {
                              response = new Response("Method not allowed for /archive", { status: 405 });
@@ -686,11 +660,9 @@ export default {
                          if (method === 'POST' && parts.length === 5) {
                              try {
                                  const payload: ResolveDrawPayload = await request.json();
-                                 // Basic payload validation
                                  if (payload.winner !== 'teamA' && payload.winner !== 'teamB') {
                                       return errorResponse("Invalid payload: winner must be 'teamA' or 'teamB'.", 400);
                                  }
-                                 // Forward POST /api/live-match/:doIdString/resolve_draw to DO's internal /internal/resolve-draw
                                  response = await forwardRequestToDO(doIdString, env, request, '/internal/resolve-draw', 'POST', payload);
                              } catch (e: any) {
                                  console.error(`Worker: Exception processing resolve_draw payload for DO ${doIdString}:`, e);
@@ -706,10 +678,20 @@ export default {
                              try {
                                  const payload: SelectTiebreakerSongPayload = await request.json();
                                  if (typeof payload.song_id !== 'number' || typeof payload.selected_difficulty !== 'string') {
-                                     return errorResponse("Invalid payload: song_id (number) and selected_difficulty (string) are required.", 400);
+                                     return errorResponse("Invalid select-tiebreaker-song payload: song_id (number) and selected_difficulty (string) are required.", 400);
                                  }
-                                 // Forward POST /api/live-match/:doIdString/select_tiebreaker_song to DO's internal /internal/select-tiebreaker-song
-                                 response = await forwardRequestToDO(doIdString, env, request, '/internal/select-tiebreaker-song', 'POST', payload);
+                                 // Before forwarding, fetch song details from D1 to pass to DO
+                                 const song = await env.DB.prepare("SELECT * FROM songs WHERE id = ?").bind(payload.song_id).first<Song>();
+                                 if (!song) {
+                                      return errorResponse(`Song with ID ${payload.song_id} not found in D1.`, 404);
+                                 }
+                                 // Pass song details along with selection to DO
+                                 const doPayload = {
+                                     song_id: payload.song_id,
+                                     selected_difficulty: payload.selected_difficulty,
+                                     song_details: song // Pass the full song object from D1
+                                 };
+                                 response = await forwardRequestToDO(doIdString, env, request, '/internal/select-tiebreaker-song', 'POST', doPayload);
                              } catch (e: any) {
                                  console.error(`Worker: Exception processing select_tiebreaker_song payload for DO ${doIdString}:`, e);
                                  response = errorResponse(`Invalid payload format: ${e.message}`, 400);
@@ -718,7 +700,6 @@ export default {
                              response = new Response("Method not allowed for /select_tiebreaker_song", { status: 405 });
                          }
                          break;
-                    // Add other live match actions here
                     default:
                         response = new Response("Not Found.", { status: 404 });
                         break;
@@ -775,19 +756,20 @@ export default {
                      `;
                      const { results: rounds } = await env.DB.prepare(roundsQuery).bind(match.id).all<any>(); // Use 'any' or a specific history round type
 
-                     // Parse round_summary_json for each round
-                     const roundsWithParsedSummary = rounds.map(round => ({
+                     // Parse round_summary_json and add fullCoverUrl for each round
+                     const roundsWithParsedData = rounds.map(round => ({
                          ...round,
-                         round_summary: round.round_summary_json ? JSON.parse(round.round_summary_json) : null,
-                         // Optional: Construct fullCoverUrl for song in history
-                         fullCoverUrl: round.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}/${round.cover_filename}` : undefined,
+                         round_summary: round.round_summary_json ? JSON.parse(round.round_summary_json) as RoundSummary : null,
+                         // Assuming SONG_COVER_BUCKET binding exists and covers are public or served via Worker
+                         // Use .r2.dev public access or your custom domain
+                         fullCoverUrl: round.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}.r2.dev/${round.cover_filename}` : undefined,
                          // Remove raw JSON field
                          // round_summary_json: undefined,
                      }));
 
                      return {
                          ...match,
-                         rounds: roundsWithParsedSummary,
+                         rounds: roundsWithParsedData,
                      };
                  });
 
