@@ -1,29 +1,24 @@
+// wrangler.jsonc
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "ngu3rd-worker",
 	"main": "src/index.ts",
-	"compatibility_date": "2024-04-25", // Your date, ensure it's recent enough for DO features
-	// "compatibility_flags": ["nodejs_compat"], // If needed
-  
+	"compatibility_date": "2024-04-25",
+
 	"observability": {
 	  "enabled": true
 	},
-  
-	// Add or ensure this section exists and is correct
+
 	"durable_objects": {
 	  "bindings": [
 		{ "name": "MATCH_DO", "class_name": "MatchDO" }
 	  ]
 	},
-	// This migration is needed when you first introduce a new DO class
-	// or change its class_name. Wrangler might prompt you or handle it.
-	// If deploying for the first time with this DO, include a migration.
 	"migrations": [
-     // 将 "new_classes" 修改为 "new_sqlite_classes"
      { "tag": "v1-init-match-do-sqlite", "new_sqlite_classes": ["MatchDO"] }
-     // 如果你有其他旧的 migration，可以注释掉或删除，或者确保它们也适用
+     // 确保这个 tag 是唯一的，或者根据你的迁移历史调整
   ],
-  
+
 	"d1_databases": [
 	  {
 		"binding": "DB",
@@ -33,12 +28,17 @@
 	],
 	"r2_buckets": [
 	  {
-		"binding": "AVATAR_BUCKET",
-		"bucket_name": "ngusignup"
-	  }
+		"binding": "AVATAR_BUCKET", 
+		"bucket_name": "ngusignup" 
+	  },
+      {
+        "binding": "SONG_COVER_BUCKET", 
+        "bucket_name": "ngu3rdcover" 
+      }
 	],
+    "vars": {
+    },
 	"routes": [
 	  { "pattern": "ngu3rd.mpam-lab.xyz/api/*", "zone_name": "mpam-lab.xyz" }
 	]
-  }
-  
+}
