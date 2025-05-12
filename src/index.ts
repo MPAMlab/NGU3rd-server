@@ -190,19 +190,37 @@ export default {
 
                 const { results } = await env.DB.prepare(query).bind(...params).all<Song>();
 
+                // --- DEBUG LOG: Log raw D1 results for songs ---
+                console.log("Worker: /api/songs - Raw D1 results:", JSON.stringify(results));
+                // --- END DEBUG LOG ---
+
+
                 // Parse levels_json and construct fullCoverUrl for each song
-                const songsWithDetails = results.map(song => {
+                const songsWithDetails = results.map((song, index) => { // Added index for logging
+                    // --- DEBUG LOG: Log each song object being processed ---
+                    console.log(`Worker: /api/songs - Processing song at index ${index}:`, JSON.stringify(song));
+                    if (!song) { // Explicit check for undefined/null
+                         console.error(`Worker: /api/songs - Song at index ${index} is undefined or null! Skipping.`);
+                         return null; // Return null for undefined/null entries
+                    }
+                    // --- END DEBUG LOG ---
+
                     const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) as SongLevel : undefined;
                     // Assuming SONG_COVER_BUCKET binding exists and covers are public or served via Worker
                     // Use .r2.dev public access or your custom domain
                     const fullCoverUrl = song.cover_filename ? `https://${env.SONG_COVER_BUCKET.name}.r2.dev/${song.cover_filename}` : undefined;
 
                     return { ...song, parsedLevels, fullCoverUrl };
-                });
+                }).filter(song => song !== null); // Filter out any null entries resulting from undefined/null in results
 
                 response = jsonResponse(songsWithDetails);
             } catch (e: any) {
                 console.error("Worker: Failed to list songs:", e);
+                // --- DEBUG LOG: Log D1 error cause if available ---
+                if (e.cause) {
+                    console.error("Worker: D1 Error Cause:", e.cause);
+                }
+                // --- END DEBUG LOG ---
                 response = errorResponse(e.message);
             }
         }
@@ -346,6 +364,11 @@ export default {
                     LEFT JOIN teams tw ON tm.winner_team_id = tw.id
                     ORDER BY tm.created_at DESC; -- Order by creation date, or scheduled_time
                 `;
+
+                // --- DEBUG LOG: Log the SQL query string before preparing ---
+                console.log("Worker: /api/tournament_matches - SQL Query String:", query);
+                // --- END DEBUG LOG ---
+
                 const { results } = await env.DB.prepare(query).all<TournamentMatch>();
 
                 // Parse JSON fields before returning
@@ -363,6 +386,11 @@ export default {
                 response = jsonResponse(matchesWithParsedData);
             } catch (e: any) {
                 console.error("Worker: Failed to list tournament matches:", e);
+                // --- DEBUG LOG: Log D1 error cause if available ---
+                if (e.cause) {
+                    console.error("Worker: D1 Error Cause:", e.cause);
+                }
+                // --- END DEBUG LOG ---
                 response = errorResponse(e.message);
             }
         }
