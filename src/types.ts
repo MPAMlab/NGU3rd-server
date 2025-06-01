@@ -1,11 +1,22 @@
 // src/types.ts
 
-// Represents the environment variables and bindings
+// Represents the environment variables and bindings for the Worker
 export interface Env {
-    MATCH_DO: DurableObjectNamespace;
-    DB: D1Database;
-    AVATAR_BUCKET: R2Bucket;
-    SONG_COVER_BUCKET: R2Bucket; // **保留这个绑定**
+    MATCH_DO: DurableObjectNamespace; // Durable Object binding
+    DB: D1Database; // D1 database binding
+    AVATAR_BUCKET: R2Bucket; // R2 bucket for avatars
+    SONG_COVER_BUCKET: R2Bucket; // R2 bucket for song covers (Keep this binding)
+
+    // Kinde Secrets (from Cloudflare Pages/Worker Environment Variables)
+    KINDE_CLIENT_ID: string;
+    KINDE_CLIENT_SECRET: string;
+    KINDE_ISSUER_URL: string; // e.g., https://YOUR_KINDE_DOMAIN.kinde.com
+    KINDE_REDIRECT_URI: string; // e.g., https://your-app.pages.dev/callback
+    LOGOUT_REDIRECT_TARGET_URL: string; // e.g., https://your-app.pages.dev/
+
+    // Other Secrets
+    ADMIN_API_KEY?: string; // Optional: If you still need a fallback admin key, otherwise remove
+    R2_PUBLIC_BUCKET_URL: string; // <-- ADD THIS: The base URL for your R2 bucket (e.g., https://pub-xxxxxxxxxxxx.r2.dev)
 }
 
 // --- 固定表相关类型 (members, teams) ---
@@ -13,7 +24,7 @@ export interface Team {
     id: number;
     code: string;
     name: string;
-    created_at?: number | null;
+    created_at?: number | null; // Unix timestamp
     current_health?: number | null;
     has_revive_mirror?: number | null;
     status?: string | null;
@@ -28,11 +39,20 @@ export interface Member {
     nickname: string;
     qq_number?: string | null;
     avatar_url?: string | null;
-    joined_at?: number | null;
-    updated_at?: number | null;
-    kinde_user_id?: string | null;
-    is_admin?: number | null;
+    joined_at?: number | null; // Unix timestamp
+    updated_at?: number | null; // Unix timestamp
+    kinde_user_id: string | null; // <-- CONFIRMED: Kinde User ID
+    is_admin: number | null; // <-- CONFIRMED: 0 or 1
 }
+
+// Basic Kinde User Info (from ID token payload, returned by backend callback)
+export interface KindeUser {
+    id: string; // Kinde User ID (sub claim)
+    email?: string;
+    name?: string; // Or other name claims like given_name, family_name
+    // Add other claims you might need from the ID token
+}
+
 
 // --- 歌曲相关类型 ---
 export interface SongLevel {
@@ -43,8 +63,8 @@ export interface SongLevel {
     R?: string;
 }
 
-// REMOVED: ImportedSongItem (不再需要)
-// REMOVED: ImportSongsPayload (不再需要)
+// REMOVED: ImportedSongItem (Assuming admin import is handled elsewhere or differently now)
+// REMOVED: ImportSongsPayload (Assuming admin import is handled elsewhere or differently now)
 
 export interface Song {
     id: number;
@@ -54,9 +74,10 @@ export interface Song {
     levels_json?: string | null;
     type?: string | null;
     cover_filename?: string | null;
-    source_data_version?: string | null; // 仍然可以用来标记数据来源或版本
+    source_data_version?: string | null;
     created_at?: string;
 
+    // Frontend convenience fields (populated by Worker)
     parsedLevels?: SongLevel;
     fullCoverUrl?: string;
 }
@@ -69,11 +90,21 @@ export interface MemberSongPreference {
     selected_difficulty: string;
     created_at?: string;
 
+    // Denormalized song info for display (fetched via JOIN or separate query)
     song_title?: string;
     cover_filename?: string;
     fullCoverUrl?: string;
     parsedLevels?: SongLevel;
 }
+
+// Payload for saving a member's song preference (POST /api/member_song_preferences)
+export interface SaveMemberSongPreferencePayload {
+    member_id: number;
+    tournament_stage: string;
+    song_id: number;
+    selected_difficulty: string;
+}
+
 
 // --- 比赛核心类型 (与之前相同) ---
 export interface MatchSong {
@@ -111,7 +142,7 @@ export interface TournamentMatch {
     winner_team_id?: number | null;
     match_do_id?: string | null;
     scheduled_time?: string | null;
-    current_match_song_index?: number;
+    current_match_song_index?: number; // Added this based on DO state
     team1_player_order_json?: string; // Raw JSON from D1
     team2_player_order_json?: string; // Raw JSON from D1
     match_song_list_json?: string;    // Raw JSON from D1
@@ -146,7 +177,7 @@ export interface ConfirmMatchSetupPayload {
 }
 
 export interface MatchState {
-    match_do_id: string;
+    match_do_id: string; // Actual DO hex ID
     tournament_match_id: number;
     status: 'pending_scores' | 'round_finished' | 'team_A_wins' | 'team_B_wins' | 'draw_pending_resolution' | 'tiebreaker_pending_song' | 'archived';
     round_name: string;
@@ -164,6 +195,7 @@ export interface MatchState {
     teamA_current_player_nickname?: string;
     teamB_current_player_nickname?: string;
     teamA_current_player_profession?: string | null;
+    teamB_current_player_profession?: string | null; // Added missing property
     teamA_mirror_available: boolean;
     teamB_mirror_available: boolean;
     match_song_list: MatchSong[];
@@ -174,6 +206,7 @@ export interface MatchState {
     teamB_members?: Member[];
 }
 
+// Payload for initializing DO from D1 TournamentMatch data (Internal to Worker/DO)
 export interface MatchScheduleData {
     tournamentMatchId: number;
     round_name: string;
@@ -187,6 +220,7 @@ export interface MatchScheduleData {
     team2_player_order_ids: number[];
     match_song_list: MatchSong[];
 }
+
 
 export interface CalculateRoundPayload {
     teamA_percentage: number;
@@ -248,9 +282,9 @@ export interface RoundSummary {
 }
 
 export interface MatchHistoryRound {
-    id: number;
+    id: number; // match_rounds_history PK
     tournament_match_id: number;
-    match_do_id: string;
+    match_do_id: string; // Actual DO hex ID
     round_number_in_match: number;
     song_id: number | null;
     selected_difficulty: string | null;
@@ -268,36 +302,45 @@ export interface MatchHistoryRound {
     team2_health_before: number | null;
     team1_health_after: number | null;
     team2_health_after: number | null;
-    team1_mirror_triggered: number | null;
-    team2_mirror_triggered: number | null;
+    team1_mirror_triggered: number | null; // D1 stores 0/1
+    team2_mirror_triggered: number | null; // D1 stores 0/1
     team1_effect_value: number | null;
     team2_effect_value: number | null;
-    is_tiebreaker_song: number | null;
+    is_tiebreaker_song: number | null; // D1 stores 0/1
     recorded_at: string;
-    round_summary_json: string | null;
+    round_summary_json: string | null; // Raw JSON string from D1
+
+    // Denormalized fields from JOINs
     song_title?: string | null;
     cover_filename?: string | null;
     picker_team_name?: string | null;
     picker_member_nickname?: string | null;
     team1_member_nickname?: string | null;
     team2_member_nickname?: string | null;
-    round_summary?: RoundSummary | null;
-    fullCoverUrl?: string;
+
+    // Frontend convenience
+    round_summary?: RoundSummary | null; // Parsed RoundSummary
+    fullCoverUrl?: string; // Constructed R2 URL
 }
 
 export interface MatchHistoryMatch {
-    id: number;
+    id: number; // tournament_matches PK
     round_name: string;
     scheduled_time: string | null;
-    status: 'completed' | 'archived';
+    status: 'completed' | 'archived'; // History only shows these statuses
     final_score_team1: number | null;
     final_score_team2: number | null;
+
+    // Denormalized fields from JOINs
     team1_name?: string;
     team2_name?: string;
     winner_team_name?: string;
+
+    // Associated rounds
     rounds: MatchHistoryRound[];
 }
 
+// Generic API Response Wrapper (used by both frontend and backend)
 export interface ApiResponse<T = any> {
     success: boolean;
     data?: T;
@@ -306,3 +349,27 @@ export interface ApiResponse<T = any> {
 }
 
 export type InternalProfession = 'attacker' | 'defender' | 'supporter' | null;
+
+
+// --- NEW TYPES FOR PAGINATION AND SONG FILTERS (from store.ts) ---
+// Move these from store.ts to here for shared use
+
+export interface PaginationInfo {
+    currentPage: number;
+    pageSize: number;
+    totalItems: number;
+    totalPages: number;
+}
+
+// Specific response data structure for GET /api/songs
+export interface SongsApiResponseData {
+    songs: Song[]; // Array of songs for the current page
+    pagination: PaginationInfo; // Pagination metadata
+}
+
+// Specific response data structure for GET /api/songs/filters
+export interface SongFiltersApiResponseData {
+    categories: string[];
+    types: string[];
+}
+
