@@ -1,7 +1,7 @@
 // src/index.ts
 
 // --- Imports ---
-// Import @tsndr/cloudflare-worker-jwt for Kinde Auth (From File 2)
+// Import @tsndr/cloudflare-worker-jwt for Kinde Auth
 import jwt from '@tsndr/cloudflare-worker-jwt';
 
 // Import your backend types (Ensure this file exists and contains necessary types)
@@ -26,13 +26,22 @@ import type {
     SongFiltersApiResponseData,
     PaginationInfo,
     KindeUser,
-    MatchHistoryMatch, // Added from File 1 history handler
-    MatchHistoryRound // Added from File 1 history handler
+    MatchHistoryMatch,
+    MatchHistoryRound,
+    // Import NEW backend types from File 1
+    MatchPlayerSelection,
+    SaveMatchPlayerSelectionPayload,
+    FetchUserMatchSelectionData,
+    MatchSelectionStatus,
+    CompileMatchSetupResponse,
+    // Add missing payloads used in existing handlers
+    CreateTournamentMatchPayload, // Used in handleCreateTournamentMatch
+    ConfirmMatchSetupPayload // Used in handleConfirmMatchSetup
 } from './types'; // Adjust path to your types file
 
 import { MatchDO } from './durable-objects/matchDo'; // Adjust path to your DO file
 
-// Import standard Worker types for clarity (From File 2)
+// Import standard Worker types for clarity
 import { D1Database, R2Bucket, ExecutionContext, DurableObjectStub, DurableObjectId } from "@cloudflare/workers-types";
 
 
@@ -45,19 +54,18 @@ const CORS_HEADERS = {
     'Access-Control-Allow-Credentials': 'true', // IMPORTANT for cookies
 };
 
-// Add this variable outside the fetch handler to cache the JWKS (From File 2)
 let cachedJwks: any = undefined; // Cache the fetched JWKS
 
 
 // --- Helper Functions ---
 
-// Helper to get a DO instance by Name string (using idFromName) (From File 1/2 - same)
+// Helper to get a DO instance by Name string (using idFromName)
 const getMatchDO = (doName: string, env: Env): DurableObjectStub => {
     const id: DurableObjectId = env.MATCH_DO.idFromName(doName);
     return env.MATCH_DO.get(id);
 };
 
-// Helper to handle forwarding requests to DOs (Using File 2's improved version)
+// Helper to handle forwarding requests to DOs
 const forwardRequestToDO = async (doIdString: string, env: Env, request: Request, internalPath: string, method: string = 'POST', bodyData?: any): Promise<Response> => {
     try {
         const doStub = getMatchDO(doIdString, env);
@@ -139,7 +147,7 @@ const forwardRequestToDO = async (doIdString: string, env: Env, request: Request
 };
 
 
-// Helper to wrap responses in ApiResponse format (From File 1/2 - same)
+// Helper to wrap responses in ApiResponse format
 function jsonResponse<T>(data: T, status: number = 200): Response {
     return new Response(JSON.stringify({ success: true, data }), {
         status,
@@ -147,7 +155,7 @@ function jsonResponse<T>(data: T, status: number = 200): Response {
     });
 }
 
-// Helper to wrap error responses (Using File 2's version with details)
+// Helper to wrap error responses
 function errorResponse(error: string, status: number = 500, details?: any): Response {
     console.error(`API Error (${status}): ${error}`, details); // Log errors on the backend
     return new Response(JSON.stringify({ success: false, error, details }), { // Include details in response body
@@ -157,7 +165,7 @@ function errorResponse(error: string, status: number = 500, details?: any): Resp
 }
 
 
-// Placeholder for R2 Avatar Upload (Using File 2's version with logging)
+// Placeholder for R2 Avatar Upload
 async function uploadAvatar(env: Env, file: File, identifier: string, teamCode: string): Promise<string | null> {
     console.log(`Uploading avatar for ${identifier} in team ${teamCode}`);
     try {
@@ -179,7 +187,7 @@ async function uploadAvatar(env: Env, file: File, identifier: string, teamCode: 
     }
 }
 
-// Placeholder for R2 Avatar Deletion (Using File 2's version with logging)
+// Placeholder for R2 Avatar Deletion
 async function deleteAvatarFromR2(env: Env, url: string): Promise<void> {
     console.log(`Deleting avatar from R2: ${url}`);
     try {
@@ -202,7 +210,7 @@ async function deleteAvatarFromR2(env: Env, url: string): Promise<void> {
     }
 }
 
-// Placeholder for checking and deleting empty teams (From File 1/2 - same)
+// Placeholder for checking and deleting empty teams
 async function checkAndDeleteEmptyTeam(env: Env, teamCode: string): Promise<void> {
     console.log(`Checking if team ${teamCode} is empty for deletion.`);
     try {
@@ -225,7 +233,7 @@ async function checkAndDeleteEmptyTeam(env: Env, teamCode: string): Promise<void
     }
 }
 
-// Helper functions for CSV export (From File 1/2 - same)
+// Helper functions for CSV export
 function getColorText(colorId: string | null | undefined): string {
      const map: { [key: string]: string } = { red: '火', green: '木', blue: '水' };
      return map[colorId || ''] || '未知';
@@ -254,9 +262,9 @@ function formatTimestamp(timestamp: number | null | undefined): string {
 }
 
 
-// --- Kinde Authentication Helpers (Using File 2's logic) ---
+// --- Kinde Authentication Helpers ---
 
-// Helper to verify Kinde Access Token using @tsndr/cloudflare-worker-jwt (From File 2)
+// Helper to verify Kinde Access Token using @tsndr/cloudflare-worker-jwt
 async function verifyKindeToken(env: Env, token: string): Promise<{ userId: string, claims: any } | null> {
     if (!env.KINDE_ISSUER_URL) {
         console.error("KINDE_ISSUER_URL not configured in Worker secrets.");
@@ -297,7 +305,7 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
              return null; // Missing subject
         }
 
-        // 检查azp字段 - 对于多域名Kinde认证的特殊处理 (From File 2)
+        // 检查azp字段 - 对于多域名Kinde认证的特殊处理
         if ((!payload.aud || (Array.isArray(payload.aud) && payload.aud.length === 0)) &&
             payload.azp === expectedAudience) {
             console.log("Empty audience with matching azp detected - skipping signature verification and trusting token");
@@ -306,7 +314,7 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
             return { userId: payload.sub as string, claims: payload };
         }
 
-        // 3. Fetch or use cached JWKS (From File 2)
+        // 3. Fetch or use cached JWKS
         if (!cachedJwks) {
             const jwksUrl = `${env.KINDE_ISSUER_URL}/.well-known/jwks`;
             console.log(`Fetching JWKS from: ${jwksUrl}`);
@@ -321,14 +329,14 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
             console.log("Using cached JWKS."); // Log cache hit
         }
 
-        // Ensure cachedJwks is valid before proceeding (From File 2)
+        // Ensure cachedJwks is valid before proceeding
         if (!cachedJwks || !Array.isArray(cachedJwks.keys)) {
              console.error("Cached JWKS is invalid.");
              cachedJwks = undefined; // Clear invalid cache
              return null;
         }
 
-        // 4. Find the correct key from the JWKS based on the token's kid (From File 2)
+        // 4. Find the correct key from the JWKS based on the token's kid
         const kid = header.kid;
         const key = cachedJwks.keys.find((k: any) => k.kid === kid);
         if (!key) {
@@ -338,7 +346,7 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
         }
         console.log("Found matching JWK:", key);
 
-        // 5. Import the JWK as a CryptoKey using Web Crypto API (From File 2)
+        // 5. Import the JWK as a CryptoKey using Web Crypto API
         console.log("Attempting to import JWK as CryptoKey...");
         let publicKey: CryptoKey;
         try {
@@ -360,13 +368,13 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
             return null; // Failed to import key
         }
 
-        // 6. Verify the token signature and claims using the imported CryptoKey (From File 2)
+        // 6. Verify the token signature and claims using the imported CryptoKey
         console.log("Attempting to verify token signature and claims with @tsndr/cloudflare-worker-jwt using CryptoKey...");
 
-        // 验证选项 - 如果是空audience，就不检查audience (From File 2)
+        // 验证选项 - 如果是空audience，就不检查audience
         const verifyOptions: any = { algorithms: ['RS256'] };
 
-        // 只在audience不为空的情况下验证audience (From File 2)
+        // 只在audience不为空的情况下验证audience
         if (payload.aud && Array.isArray(payload.aud) && payload.aud.length > 0) {
             verifyOptions.audience = expectedAudience;
         } else {
@@ -394,7 +402,7 @@ async function verifyKindeToken(env: Env, token: string): Promise<{ userId: stri
 }
 
 
-// Middleware-like function to extract Kinde User ID from token/cookie (Using File 2's improved version)
+// Middleware-like function to extract Kinde User ID from token/cookie
 async function getAuthenticatedKindeUser(request: Request, env: Env): Promise<string | null> {
     const authHeader = request.headers.get('Authorization');
     let token = null;
@@ -408,7 +416,7 @@ async function getAuthenticatedKindeUser(request: Request, env: Env): Promise<st
     else {
         const cookieHeader = request.headers.get('Cookie');
         if (cookieHeader) {
-            // More robust cookie parsing (From File 2)
+            // More robust cookie parsing
             const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
                 const [key, value] = cookie.trim().split('=');
                 acc[key] = value;
@@ -431,7 +439,7 @@ async function getAuthenticatedKindeUser(request: Request, env: Env): Promise<st
         return null; // No token found
     }
 
-    const verificationResult = await verifyKindeToken(env, token); // Uses the File 2 verify function
+    const verificationResult = await verifyKindeToken(env, token);
     if (!verificationResult) {
         console.warn("Kinde token verification failed.");
         return null; // Token invalid or expired
@@ -441,7 +449,7 @@ async function getAuthenticatedKindeUser(request: Request, env: Env): Promise<st
     return verificationResult.userId; // Return the Kinde user ID
 }
 
-// Helper to check if the authenticated Kinde user is marked as admin in the DB (From File 1/2 - same core logic)
+// Helper to check if the authenticated Kinde user is marked as admin in the DB
 async function isAdminUser(env: Env, kindeUserId: string): Promise<boolean> {
     if (!kindeUserId) return false;
     try {
@@ -449,7 +457,7 @@ async function isAdminUser(env: Env, kindeUserId: string): Promise<boolean> {
             .bind(kindeUserId)
             .first<{ is_admin: number | null }>();
         const isAdmin = member?.is_admin === 1;
-        console.log(`Checking admin status for Kinde ID ${kindeUserId}: ${isAdmin ? 'Is Admin' : 'Not Admin'}`); // Added logging from File 2
+        console.log(`Checking admin status for Kinde ID ${kindeUserId}: ${isAdmin ? 'Is Admin' : 'Not Admin'}`);
         return isAdmin;
     } catch (e: any) {
         console.error(`Database error checking admin status for Kinde ID ${kindeUserId}:`, e);
@@ -458,14 +466,14 @@ async function isAdminUser(env: Env, kindeUserId: string): Promise<boolean> {
 }
 
 
-// --- Collection Status Helper (From File 1/2 - same core logic) ---
+// --- Collection Status Helper ---
 async function isCollectionPaused(env: Env): Promise<boolean> {
     try {
         const setting = await env.DB.prepare('SELECT value FROM settings WHERE key = ? LIMIT 1')
             .bind('collection_paused')
             .first<{ value: string }>();
         const isPaused = setting?.value === 'true';
-        console.log(`Collection paused status: ${isPaused}`); // Added logging from File 2
+        console.log(`Collection paused status: ${isPaused}`);
         return isPaused;
     } catch (e: any) {
         console.error('Database error fetching collection_paused setting:', e);
@@ -474,48 +482,48 @@ async function isCollectionPaused(env: Env): Promise<boolean> {
 }
 
 
-// --- Authentication Middleware (Using File 2's version with logging) ---
+// --- Authentication Middleware ---
 // This middleware checks if the user is authenticated via Kinde token/cookie.
 // If authenticated, it calls the next handler with the kindeUserId.
 // If not authenticated, it returns a 401 Unauthorized response.
 type AuthenticatedHandler = (request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string) => Promise<Response>;
 
 async function authMiddleware(request: Request, env: Env, ctx: ExecutionContext, handler: AuthenticatedHandler): Promise<Response> {
-    console.log(`Running authMiddleware for ${new URL(request.url).pathname}`); // Added logging from File 2
-    const kindeUserId = await getAuthenticatedKindeUser(request, env); // Uses the File 2 getAuthenticatedKindeUser
+    console.log(`Running authMiddleware for ${new URL(request.url).pathname}`);
+    const kindeUserId = await getAuthenticatedKindeUser(request, env);
 
     if (!kindeUserId) {
         console.warn(`Authentication required for ${new URL(request.url).pathname}`);
-        return errorResponse('Authentication required.', 401); // Uses File 2 errorResponse
+        return errorResponse('Authentication required.', 401);
     }
 
-    console.log(`User authenticated with Kinde ID: ${kindeUserId}. Proceeding to handler.`); // Added logging from File 2
+    console.log(`User authenticated with Kinde ID: ${kindeUserId}. Proceeding to handler.`);
     // User is authenticated, proceed to the actual handler with the user ID
     return handler(request, env, ctx, kindeUserId);
 }
 
-// --- Admin Authentication Middleware (Using File 2's version with logging) ---
+// --- Admin Authentication Middleware ---
 // This middleware checks if the user is authenticated AND is an admin.
 type AdminAuthenticatedHandler = (request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string) => Promise<Response>;
 
 async function adminAuthMiddleware(request: Request, env: Env, ctx: ExecutionContext, handler: AdminAuthenticatedHandler): Promise<Response> {
-    console.log(`Running adminAuthMiddleware for ${new URL(request.url).pathname}`); // Added logging from File 2
+    console.log(`Running adminAuthMiddleware for ${new URL(request.url).pathname}`);
     // First, check if the user is authenticated at all
-    const kindeUserId = await getAuthenticatedKindeUser(request, env); // Uses the File 2 getAuthenticatedKindeUser
+    const kindeUserId = await getAuthenticatedKindeUser(request, env);
 
     if (!kindeUserId) {
         console.warn(`Admin access denied: User not authenticated via Kinde for ${new URL(request.url).pathname}`);
-        return errorResponse('Authentication required.', 401); // Uses File 2 errorResponse
+        return errorResponse('Authentication required.', 401);
     }
 
     // If authenticated, check if they are an admin
-    const isAdmin = await isAdminUser(env, kindeUserId); // Uses the File 2 isAdminUser
+    const isAdmin = await isAdminUser(env, kindeUserId);
     if (!isAdmin) {
         console.warn(`Admin access denied: User ${kindeUserId} is not an admin for ${new URL(request.url).pathname}`);
-        return errorResponse('Authorization failed: You do not have administrator privileges.', 403); // Uses File 2 errorResponse
+        return errorResponse('Authorization failed: You do not have administrator privileges.', 403);
     }
 
-    console.log(`Admin user ${kindeUserId} authenticated. Proceeding to admin handler.`); // Added logging from File 2
+    console.log(`Admin user ${kindeUserId} authenticated. Proceeding to admin handler.`);
     // If authenticated and is admin, proceed to the actual admin handler
     return handler(request, env, ctx, kindeUserId);
 }
@@ -523,39 +531,39 @@ async function adminAuthMiddleware(request: Request, env: Env, ctx: ExecutionCon
 
 // --- Route Handlers ---
 
-// GET /api/settings (Public) (From File 1/2 - same)
+// GET /api/settings (Public)
 async function handleGetSettings(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/settings request...');
     try {
         const paused = await isCollectionPaused(env);
         return jsonResponse({ collection_paused: paused }, 200);
-    } catch (e: any) { // Added type any for catch error
+    } catch (e: any) {
         console.error('Error fetching settings:', e);
-        return errorResponse('Failed to fetch settings.', 500, e); // Uses File 2 errorResponse
+        return errorResponse('Failed to fetch settings.', 500, e);
     }
 }
 
-// POST /api/kinde/callback (Public) - NEW (From File 2)
+// POST /api/kinde/callback (Public)
 async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     console.log('Handling /api/kinde/callback request...');
     const url = new URL(request.url);
     const body = await request.json().catch(() => null);
-    if (!body) return errorResponse('Invalid or missing JSON body.', 400); // Uses File 2 errorResponse
+    if (!body) return errorResponse('Invalid or missing JSON body.', 400);
 
     const { code, code_verifier, redirect_uri } = body;
 
     if (!code || !code_verifier || !redirect_uri) {
-        return errorResponse('Missing code, code_verifier, or redirect_uri in callback request.', 400); // Uses File 2 errorResponse
+        return errorResponse('Missing code, code_verifier, or redirect_uri in callback request.', 400);
     }
 
     if (!env.KINDE_CLIENT_ID || !env.KINDE_CLIENT_SECRET || !env.KINDE_ISSUER_URL || !env.KINDE_REDIRECT_URI || !env.LOGOUT_REDIRECT_TARGET_URL) {
          console.error("Kinde secrets not configured in Worker.");
-         return errorResponse('Server configuration error.', 500); // Uses File 2 errorResponse
+         return errorResponse('Server configuration error.', 500);
     }
 
     try {
         const tokenUrl = `${env.KINDE_ISSUER_URL}/oauth2/token`;
-        console.log(`Exchanging code for token at: ${tokenUrl}`); // Added logging from File 2
+        console.log(`Exchanging code for token at: ${tokenUrl}`);
         const tokenResponse = await fetch(tokenUrl, {
             method: 'POST',
             headers: {
@@ -572,45 +580,43 @@ async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionCon
         });
 
         const tokenData = await tokenResponse.json();
-        console.log("Kinde token exchange response status:", tokenResponse.status); // Added logging from File 2
-        console.log("Kinde token exchange response body:", tokenData); // Added logging from File 2
+        console.log("Kinde token exchange response status:", tokenResponse.status);
+        console.log("Kinde token exchange response body:", tokenData);
 
 
         if (!tokenResponse.ok) {
             console.error('Kinde token exchange failed:', tokenResponse.status, tokenData);
-            return errorResponse(tokenData.error_description || tokenData.error || 'Failed to exchange authorization code for tokens.', tokenResponse.status); // Uses File 2 errorResponse
+            return errorResponse(tokenData.error_description || tokenData.error || 'Failed to exchange authorization code for tokens.', tokenResponse.status);
         }
 
         const { access_token, id_token, refresh_token, expires_in } = tokenData;
 
         const headers = new Headers(CORS_HEADERS);
         const secure = url.protocol === 'https:' ? '; Secure' : '';
-        // Removed Domain attribute from cookie setting (From File 2)
         headers.append('Set-Cookie', `kinde_access_token=${access_token}; HttpOnly; Path=/; Max-Age=${expires_in}; SameSite=Lax${secure}`);
-        console.log("Set kinde_access_token cookie."); // Added logging from File 2
+        console.log("Set kinde_access_token cookie.");
 
         // Set Refresh Token cookie (HttpOnly)
         if (refresh_token) {
              const refreshTokenMaxAge = 30 * 24 * 60 * 60; // 30 days
-             // Removed Domain attribute from cookie setting (From File 2)
              headers.append('Set-Cookie', `kinde_refresh_token=${refresh_token}; HttpOnly; Path=/; Max-Age=${refreshTokenMaxAge}; SameSite=Lax${secure}`);
-             console.log("Set kinde_refresh_token cookie."); // Added logging from File 2
+             console.log("Set kinde_refresh_token cookie.");
         }
 
-        // Decode ID token for basic user info to return to frontend (Using File 2's jwt.decode)
+        // Decode ID token for basic user info to return to frontend
         let userInfo: KindeUser | {} = {};
         try {
-            console.log("Decoding ID token payload..."); // Added logging from File 2
-            const idTokenDecoded = jwt.decode(id_token); // Uses File 2's jwt.decode
+            console.log("Decoding ID token payload...");
+            const idTokenDecoded = jwt.decode(id_token);
             const idTokenPayload = idTokenDecoded.payload;
 
-            console.log("ID Token Payload:", idTokenPayload); // Added logging from File 2
+            console.log("ID Token Payload:", idTokenPayload);
             userInfo = {
                 id: idTokenPayload.sub, // Kinde User ID
                 email: idTokenPayload.email,
                 name: idTokenPayload.given_name && idTokenPayload.family_name ? `${idTokenPayload.given_name} ${idTokenPayload.family_name}` : idTokenPayload.given_name || idTokenPayload.family_name || idTokenPayload.email,
             } as KindeUser;
-            console.log("Decoded User Info:", userInfo); // Added logging from File 2
+            console.log("Decoded User Info:", userInfo);
         } catch (e) {
             console.error("Failed to decode ID token payload:", e);
         }
@@ -620,24 +626,22 @@ async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionCon
             headers: headers,
         });
 
-    } catch (kindeError: any) { // Added type any for catch error
+    } catch (kindeError: any) {
         console.error('Error during Kinde token exchange:', kindeError);
-        return errorResponse('Failed to communicate with authentication server.', 500, kindeError); // Uses File 2 errorResponse
+        return errorResponse('Failed to communicate with authentication server.', 500, kindeError);
     }
 }
 
-// NEW: GET /api/logout (Public) - Handles clearing HttpOnly cookies and redirect (From File 2)
+// GET /api/logout (Public)
 async function handleLogout(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/logout request...');
     const url = new URL(request.url);
     const headers = new Headers(CORS_HEADERS);
     const secure = url.protocol === 'https:' ? '; Secure' : '';
-    // Removed Domain attribute from cookie setting (From File 2)
     headers.append('Set-Cookie', `kinde_access_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`);
-    console.log("Cleared kinde_access_token cookie."); // Added logging from File 2
-    // Removed Domain attribute from cookie setting (From File 2)
+    console.log("Cleared kinde_access_token cookie.");
     headers.append('Set-Cookie', `kinde_refresh_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`);
-    console.log("Cleared kinde_refresh_token cookie."); // Added logging from File 2
+    console.log("Cleared kinde_refresh_token cookie.");
 
 
     // Redirect to Kinde's logout endpoint
@@ -649,14 +653,14 @@ async function handleLogout(request: Request, env: Env): Promise<Response> {
 
     const kindeLogoutUrl = new URL(`${env.KINDE_ISSUER_URL}/logout`);
     kindeLogoutUrl.searchParams.append('redirect', env.LOGOUT_REDIRECT_TARGET_URL);
-    console.log(`Redirecting to Kinde logout URL: ${kindeLogoutUrl.toString()}`); // Added logging from File 2
+    console.log(`Redirecting to Kinde logout URL: ${kindeLogoutUrl.toString()}`);
 
     // Return a redirect response
     return Response.redirect(kindeLogoutUrl.toString(), 302);
 }
 
 
-// GET /api/teams (Public) (From File 1/2 - same)
+// GET /api/teams (Public)
 async function handleFetchTeams(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams request...');
     try {
@@ -664,28 +668,28 @@ async function handleFetchTeams(request: Request, env: Env): Promise<Response> {
         return jsonResponse(results);
     } catch (e: any) {
         console.error("Worker: Failed to list teams:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
-// GET /api/teams/:code (Public) (From File 1/2 - same)
+// GET /api/teams/:code (Public)
 async function handleGetTeamByCode(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/:code request...');
     const parts = new URL(request.url).pathname.split('/');
     if (parts.length !== 4 || !parts[3]) {
-        return errorResponse('Invalid API path. Use /api/teams/:code', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid API path. Use /api/teams/:code', 400);
     }
     const teamCode = parts[3];
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid team code format.', 400);
     }
 
     try {
         const teamResult = await env.DB.prepare('SELECT name FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first<{ name: string }>();
 
         if (!teamResult) {
-            return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
+            return errorResponse(`Team with code ${teamCode} not found.`, 404);
         }
 
         const membersResult = await env.DB.prepare(
@@ -701,34 +705,34 @@ async function handleGetTeamByCode(request: Request, env: Env): Promise<Response
 
     } catch (e: any) {
         console.error('Database error fetching team by code:', e);
-        return errorResponse('Failed to fetch team information.', 500, e); // Uses File 2 errorResponse
+        return errorResponse('Failed to fetch team information.', 500, e);
     }
 }
 
-// POST /api/teams/check (Public) (From File 1/2 - same)
+// POST /api/teams/check (Public)
 async function handleCheckTeam(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/check request...');
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying team check.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
     }
 
     const body = await request.json().catch(() => null);
     if (!body || typeof body.teamCode !== 'string') {
-        return errorResponse('Invalid or missing teamCode in request body.', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid or missing teamCode in request body.', 400);
     }
     const teamCode = body.teamCode.trim();
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid team code format.', 400);
     }
 
     try {
         const teamResult = await env.DB.prepare('SELECT name FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first<{ name: string }>();
 
         if (!teamResult) {
-            return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
+            return errorResponse(`Team with code ${teamCode} not found.`, 404);
         }
 
         const membersResult = await env.DB.prepare(
@@ -744,37 +748,37 @@ async function handleCheckTeam(request: Request, env: Env): Promise<Response> {
 
     } catch (e: any) {
         console.error('Database error checking team:', e);
-        return errorResponse('Failed to check team information.', 500, e); // Uses File 2 errorResponse
+        return errorResponse('Failed to check team information.', 500, e);
     }
 }
 
-// POST /api/teams/create (Public) (From File 1/2 - same)
+// POST /api/teams/create (Public)
 async function handleCreateTeam(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/create request...');
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying team creation.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
     }
 
     const body = await request.json().catch(() => null);
     if (!body || typeof body.teamCode !== 'string' || typeof body.teamName !== 'string') {
-        return errorResponse('Invalid or missing teamCode or teamName in request body.', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid or missing teamCode or teamName in request body.', 400);
     }
     const teamCode = body.teamCode.trim();
     const teamName = body.teamName.trim();
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid team code format.', 400);
     }
     if (teamName.length === 0 || teamName.length > 50) {
-        return errorResponse('Team name is required (1-50 chars).', 400); // Uses File 2 errorResponse
+        return errorResponse('Team name is required (1-50 chars).', 400);
     }
 
     try {
         const existingTeam = await env.DB.prepare('SELECT 1 FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first();
         if (existingTeam) {
-            return errorResponse(`Team code ${teamCode} already exists.`, 409); // Uses File 2 errorResponse
+            return errorResponse(`Team code ${teamCode} already exists.`, 409);
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -786,19 +790,19 @@ async function handleCreateTeam(request: Request, env: Env): Promise<Response> {
 
         if (!insertResult.success) {
             console.error('Create team database insert failed:', insertResult.error);
-            return errorResponse('Failed to create team due to a database issue.', 500); // Uses File 2 errorResponse
+            return errorResponse('Failed to create team due to a database issue.', 500);
         }
 
         return jsonResponse({ success: true, message: "Team created successfully.", code: teamCode, name: teamName }, 201);
 
     } catch (e: any) {
         console.error('Database error creating team:', e);
-        return errorResponse('Failed to create team.', 500, e); // Uses File 2 errorResponse
+        return errorResponse('Failed to create team.', 500, e);
     }
 }
 
 
-// GET /api/members (Public - Can filter by team_code) (From File 1/2 - same)
+// GET /api/members (Public - Can filter by team_code)
 async function handleFetchMembers(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/members request...');
     try {
@@ -814,33 +818,33 @@ async function handleFetchMembers(request: Request, env: Env): Promise<Response>
         return jsonResponse(results);
     } catch (e: any) {
         console.error("Worker: Failed to list members:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
-// GET /api/members/:id (Public) (From File 1/2 - same)
+// GET /api/members/:id (Public)
 async function handleGetMemberById(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/members/:id request...');
     const parts = new URL(request.url).pathname.split('/');
     const memberId = parseInt(parts[3], 10);
     if (isNaN(memberId)) {
-        return errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
+        return errorResponse("Invalid member ID in path", 400);
     }
     try {
         const member = await env.DB.prepare("SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?").bind(memberId).first<Member>();
         if (member) {
             return jsonResponse(member);
         } else {
-            return errorResponse("Member not found", 404); // Uses File 2 errorResponse
+            return errorResponse("Member not found", 404);
         }
     } catch (e: any) {
         console.error(`Worker: Failed to get member ${memberId}:`, e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
 
-// GET /api/members/me (Authenticated User) - NEW (Using File 2 signature, File 1 logic)
+// GET /api/members/me (Authenticated User)
 async function handleFetchMe(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/members/me request for Kinde user ID: ${kindeUserId}`);
     try {
@@ -850,32 +854,32 @@ async function handleFetchMe(request: Request, env: Env, ctx: ExecutionContext, 
             .first<Member>();
 
         if (!member) {
-            console.log(`Member not found for Kinde ID ${kindeUserId}.`); // Added logging from File 2
+            console.log(`Member not found for Kinde ID ${kindeUserId}.`);
             // Return success: true with null data if user is authenticated but not registered
             return jsonResponse({ member: null, message: "User not registered." }, 200);
         }
 
-        console.log(`Found member for Kinde ID ${kindeUserId}: ID ${member.id}`); // Added logging from File 2
+        console.log(`Found member for Kinde ID ${kindeUserId}: ID ${member.id}`);
         return jsonResponse({ member: member }, 200); // Wrap member in data object for ApiResponse format
 
     } catch (e: any) {
         console.error(`Database error fetching member for Kinde ID ${kindeUserId}:`, e);
-        return errorResponse('Failed to fetch member information.', 500, e); // Uses File 2 errorResponse
+        return errorResponse('Failed to fetch member information.', 500, e);
     }
 }
 
 
-// POST /api/teams/join (Authenticated User) - MODIFIED to use kindeUserId (Using File 2's version)
+// POST /api/teams/join (Authenticated User)
 async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/teams/join request for Kinde user ID: ${kindeUserId}`);
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying join.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
     }
 
     let formData: FormData;
-    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format. Expected multipart/form-data.', 400, e); }
 
     const teamCode = formData.get('teamCode')?.toString();
     const color = formData.get('color')?.toString();
@@ -886,12 +890,12 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
     const avatarFile = formData.get('avatarFile');
 
      // --- Input Validation ---
-     if (!teamCode || teamCode.length !== 4 || isNaN(parseInt(teamCode))) return errorResponse('Invalid team code.', 400); // Uses File 2 errorResponse
-     if (!color || !['red', 'green', 'blue'].includes(color)) return errorResponse('Invalid color selection.', 400); // Uses File 2 errorResponse
-     if (!job || !['attacker', 'defender', 'supporter'].includes(job)) return errorResponse('Invalid job selection.', 400); // Uses File 2 errorResponse
-     if (!maimaiId || maimaiId.length === 0 || maimaiId.length > 13) return errorResponse('Maimai ID is required (1-13 chars).', 400); // Uses File 2 errorResponse
-     if (!nickname || nickname.length === 0 || nickname.length > 50) return errorResponse('Nickname is required (1-50 chars).', 400); // Uses File 2 errorResponse
-     if (!qqNumber || !/^[1-9][0-9]{4,14}$/.test(qqNumber)) return errorResponse('A valid QQ number is required.', 400); // Uses File 2 errorResponse
+     if (!teamCode || teamCode.length !== 4 || isNaN(parseInt(teamCode))) return errorResponse('Invalid team code.', 400);
+     if (!color || !['red', 'green', 'blue'].includes(color)) return errorResponse('Invalid color selection.', 400);
+     if (!job || !['attacker', 'defender', 'supporter'].includes(job)) return errorResponse('Invalid job selection.', 400);
+     if (!maimaiId || maimaiId.length === 0 || maimaiId.length > 13) return errorResponse('Maimai ID is required (1-13 chars).', 400);
+     if (!nickname || nickname.length === 0 || nickname.length > 50) return errorResponse('Nickname is required (1-50 chars).', 400);
+     if (!qqNumber || !/^[1-9][0-9]{4,14}$/.test(qqNumber)) return errorResponse('A valid QQ number is required.', 400);
      // --- End Validation ---
 
     try {
@@ -909,33 +913,33 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
          const existingMemberWithKindeId = teamChecks[2]?.results?.[0];
          const conflictCheck = teamChecks[3]?.results?.[0];
 
-         if (!teamResult) return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
-         if (memberCount >= 3) return errorResponse(`Team ${teamCode} is already full (3 members).`, 409); // Uses File 2 errorResponse
+         if (!teamResult) return errorResponse(`Team with code ${teamCode} not found.`, 404);
+         if (memberCount >= 3) return errorResponse(`Team ${teamCode} is already full (3 members).`, 409);
          if (existingMemberWithKindeId) {
-             return errorResponse('你已经报名过了，一个账号只能报名一次。', 409); // Uses File 2 errorResponse
+             return errorResponse('你已经报名过了，一个账号只能报名一次。', 409);
          }
 
          if (conflictCheck) {
              const colorConflict = await env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND color = ? LIMIT 1').bind(teamCode, color).first();
-             if (colorConflict) return errorResponse(`The color '${color}' is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
+             if (colorConflict) return errorResponse(`The color '${color}' is already taken in team ${teamCode}.`, 409);
              const jobConflict = await env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND job = ? LIMIT 1').bind(teamCode, job).first();
-             if (jobConflict) return errorResponse(`The job '${job}' is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
+             if (jobConflict) return errorResponse(`The job '${job}' is already taken in team ${teamCode}.`, 409);
              // Fallback generic conflict message if both checks pass but the batch check failed (shouldn't happen)
-             return errorResponse(`Color or job is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
+             return errorResponse(`Color or job is already taken in team ${teamCode}.`, 409);
          }
 
          let avatarUrl: string | null = null;
          if (avatarFile instanceof File) {
-              // Use Kinde User ID in avatar path for better uniqueness and association (From File 2)
+              // Use Kinde User ID in avatar path for better uniqueness and association
               const idForAvatarPath = kindeUserId; // Use kindeUserId directly
                if (!idForAvatarPath) {
                     console.error(`Cannot determine identifier for avatar path for Kinde ID ${kindeUserId}`);
-                    return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
+                    return errorResponse('Failed to determine avatar identifier.', 500);
                }
-              avatarUrl = await uploadAvatar(env, avatarFile, idForAvatarPath, teamCode); // Uses File 2 uploadAvatar
+              avatarUrl = await uploadAvatar(env, avatarFile, idForAvatarPath, teamCode);
                if (avatarUrl === null) {
                   console.warn(`Join blocked for ${maimaiId}: Avatar upload failed.`);
-                  return errorResponse('Failed to upload avatar. Member not added.', 500); // Uses File 2 errorResponse
+                  return errorResponse('Failed to upload avatar. Member not added.', 500);
                }
          }
 
@@ -950,10 +954,10 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
          if (!insertResult.success) {
              console.error('Join team database insert failed:', insertResult.error);
               if (insertResult.error?.includes('UNIQUE constraint failed')) {
-                   // This might catch unique constraints on maimai_id or kinde_user_id if they exist (From File 2)
-                   return errorResponse('Failed to add member: A record with this Maimai ID or account already exists.', 409); // Uses File 2 errorResponse
+                   // This might catch unique constraints on maimai_id or kinde_user_id if they exist
+                   return errorResponse('Failed to add member: A record with this Maimai ID or account already exists.', 409);
               }
-             return errorResponse(insertResult.error || 'Failed to add member due to a database issue.', 500); // Uses File 2 errorResponse
+             return errorResponse(insertResult.error || 'Failed to add member due to a database issue.', 500);
          }
 
          const newMemberId = insertResult.meta.last_row_id;
@@ -963,9 +967,9 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
 
          return jsonResponse({ success: true, message: "Member added successfully.", member: newMember }, 201);
 
-    } catch (processingError: any) { // Added type any for catch error
+    } catch (processingError: any) {
         console.error('Error during join team processing pipeline:', processingError);
-        return errorResponse( // Uses File 2 errorResponse
+        return errorResponse(
              `Failed to process join request: ${processingError instanceof Error ? processingError.message : 'Unknown error'}`,
              500,
              processingError
@@ -973,17 +977,17 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
     }
 }
 
-// PATCH /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth (Using File 2's version)
+// PATCH /api/members/:maimaiId (Authenticated User)
 async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
      console.log(`Handling /api/members/:maimaiId PATCH request for Kinde user ID: ${kindeUserId}`);
      const parts = new URL(request.url).pathname.split('/');
      if (parts.length !== 4 || !parts[3]) {
-         return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400); // Uses File 2 errorResponse
+         return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400);
      }
      const targetMaimaiId = parts[3]; // The Maimai ID from the URL path (used to find the record)
 
     let formData: FormData;
-    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); }
 
     // --- Authorization Step ---
     // Verify the member exists AND belongs to the authenticated Kinde user
@@ -992,7 +996,7 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
         .first<Member>();
 
     if (!existingMember) {
-        return errorResponse('Authorization failed: Member not found or does not belong to your account.', 403); // Uses File 2 errorResponse
+        return errorResponse('Authorization failed: Member not found or does not belong to your account.', 403);
     }
 
     // --- Prepare Updates ---
@@ -1012,33 +1016,33 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
 
     // --- Validate and Add Fields to Update ---
     if (newNickname !== undefined && newNickname !== existingMember.nickname) {
-        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); } // Uses File 2 errorResponse
+        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); }
         updates.nickname = newNickname; setClauses.push('nickname = ?'); params.push(newNickname);
     }
     if (newQqNumber !== undefined && newQqNumber !== existingMember.qq_number) {
-        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); } // Uses File 2 errorResponse
+        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); }
         updates.qq_number = newQqNumber; setClauses.push('qq_number = ?'); params.push(newQqNumber);
     }
     // Check Color Change and Conflict (in the member's current team)
     if (newColor !== undefined && newColor !== existingMember.color) {
-        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400); // Uses File 2 errorResponse
+        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400);
         const conflictCheck = await env.DB.prepare(
                 'SELECT 1 FROM members WHERE team_code = ? AND color = ? AND id != ? LIMIT 1'
             )
             .bind(existingMember.team_code, newColor, existingMember.id)
             .first();
-        if (conflictCheck) { return errorResponse(`The color '${newColor}' is already taken by another member in your team.`, 409); } // Uses File 2 errorResponse
+        if (conflictCheck) { return errorResponse(`The color '${newColor}' is already taken by another member in your team.`, 409); }
         updates.color = newColor; setClauses.push('color = ?'); params.push(newColor);
     }
    // Check Job Change and Conflict (in the member's current team)
    if (newJob !== undefined && newJob !== existingMember.job) {
-        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400); // Uses File 2 errorResponse
+        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400);
          const conflictCheck = await env.DB.prepare(
                  'SELECT 1 FROM members WHERE team_code = ? AND job = ? AND id != ? LIMIT 1'
             )
             .bind(existingMember.team_code, newJob, existingMember.id)
             .first();
-        if (conflictCheck) { return errorResponse(`The job '${newJob}' is already taken by another member in your team.`, 409); } // Uses File 2 errorResponse
+        if (conflictCheck) { return errorResponse(`The job '${newJob}' is already taken by another member in your team.`, 409); }
         updates.job = newJob; setClauses.push('job = ?'); params.push(newJob);
    }
 
@@ -1048,14 +1052,14 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
          if (existingMember.avatar_url) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     } else if (newAvatarFile instanceof File) {
        console.log(`Processing new avatar file upload for member ID ${existingMember.id}`);
-       // Use Kinde User ID in avatar path (From File 2)
+       // Use Kinde User ID in avatar path for better uniqueness and association
        const idForAvatarPath = existingMember.kinde_user_id || existingMember.maimai_id; // Use Kinde ID if available
        if (!idForAvatarPath) {
             console.error(`Cannot determine identifier for avatar path for member ID ${existingMember.id}`);
-            return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
+            return errorResponse('Failed to determine avatar identifier.', 500);
        }
-       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, existingMember.team_code); // Uses File 2 uploadAvatar
-       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); } // Uses File 2 errorResponse
+       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, existingMember.team_code);
+       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); }
        newAvatarUrl = uploadedUrl; updates.avatar_url = newAvatarUrl;
        if (existingMember.avatar_url && existingMember.avatar_url !== newAvatarUrl) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     }
@@ -1073,22 +1077,22 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
    console.log(`Executing user update for ID ${existingMember.id}: ${updateQuery} with params: ${JSON.stringify(params.slice(0, -1))}`);
 
    try {
-       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); } // Uses File 2 deleteAvatarFromR2
+       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); }
 
         const updateResult = await env.DB.prepare(updateQuery).bind(...params).run();
 
         if (!updateResult.success) {
              console.error(`User update member database operation failed for ID ${existingMember.id}:`, updateResult.error);
               if (updateResult.error?.includes('UNIQUE constraint failed')) {
-                   return errorResponse(`Update failed due to a conflict (color or job in team). Please check values.`, 409); // Uses File 2 errorResponse
+                   return errorResponse(`Update failed due to a conflict (color or job in team). Please check values.`, 409);
               }
-             return errorResponse('Failed to update member information due to a database issue.', 500); // Uses File 2 errorResponse
+             return errorResponse('Failed to update member information due to a database issue.', 500);
         }
 
         if (updateResult.meta.changes === 0) {
             console.warn(`User update query executed for ID ${existingMember.id} but no rows were changed.`);
             const checkExists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?').bind(existingMember.id).first();
-            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404); // Uses File 2 errorResponse
+            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404);
             return jsonResponse({ message: "No changes detected or record unchanged.", member: existingMember }, 200);
         }
 
@@ -1101,14 +1105,14 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
 
         if (!updatedMember) {
               console.error(`Consistency issue: Member ID ${existingMember.id} updated but could not be re-fetched.`);
-              return errorResponse('Update successful, but failed to retrieve updated data.', 500); // Uses File 2 errorResponse
+              return errorResponse('Update successful, but failed to retrieve updated data.', 500);
         }
 
         return jsonResponse({ success: true, message: "Information updated successfully.", member: updatedMember }, 200);
 
-   } catch (updateProcessError: any) { // Added type any for catch error
+   } catch (updateProcessError: any) {
         console.error(`Error during the user member update process for ID ${existingMember.id}:`, updateProcessError);
-        return errorResponse( // Uses File 2 errorResponse
+        return errorResponse(
              `Failed to process update: ${updateProcessError instanceof Error ? updateProcessError.message : 'Unknown error'}`,
              500,
              updateProcessError
@@ -1116,12 +1120,12 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
    }
 }
 
-// DELETE /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth (Using File 2's version)
+// DELETE /api/members/:maimaiId (Authenticated User)
 async function handleUserDeleteMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/members/:maimaiId DELETE request for Kinde user ID: ${kindeUserId}`);
     const parts = new URL(request.url).pathname.split('/');
     if (parts.length !== 4 || !parts[3]) {
-        return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400); // Uses File 2 errorResponse
+        return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400);
     }
     const targetMaimaiId = parts[3]; // The Maimai ID from the URL path
 
@@ -1132,8 +1136,8 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
         .first<{ id: number, team_code: string, avatar_url?: string | null }>();
 
     if (!existingMember) {
-        console.log(`User delete request for non-existent or unauthorized member: ${targetMaimaiId} (Kinde ID: ${kindeUserId})`); // Added logging from File 2
-        return errorResponse('Member not found or does not belong to your account.', 404); // Uses File 2 errorResponse
+        console.log(`User delete request for non-existent or unauthorized member: ${targetMaimaiId} (Kinde ID: ${kindeUserId})`);
+        return errorResponse('Member not found or does not belong to your account.', 404);
     }
 
     // --- Execute Delete ---
@@ -1141,33 +1145,33 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
         const teamCode = existingMember.team_code;
         const avatarUrlToDelete = existingMember.avatar_url;
 
-        console.log(`Attempting to delete member record for ID ${existingMember.id} (Maimai ID: ${targetMaimaiId})`); // Added logging from File 2
+        console.log(`Attempting to delete member record for ID ${existingMember.id} (Maimai ID: ${targetMaimaiId})`);
         const deleteResult = await env.DB.prepare('DELETE FROM members WHERE id = ?')
             .bind(existingMember.id)
             .run();
 
         if (!deleteResult.success) {
             console.error(`User delete member database operation failed for ID ${existingMember.id}:`, deleteResult.error);
-            return errorResponse(deleteResult.error || 'Failed to delete member due to a database issue.', 500); // Uses File 2 errorResponse
+            return errorResponse(deleteResult.error || 'Failed to delete member due to a database issue.', 500);
         }
         if (deleteResult.meta.changes === 0) {
-             console.warn(`User delete query executed for ID ${existingMember.id} but no rows changed.`); // Added logging from File 2
-             return errorResponse('Member not found or already deleted.', 404); // Uses File 2 errorResponse
+             console.warn(`User delete query executed for ID ${existingMember.id} but no rows changed.`);
+             return errorResponse('Member not found or already deleted.', 404);
         }
-        console.log(`Successfully deleted member record for ID ${existingMember.id}.`); // Added logging from File 2
+        console.log(`Successfully deleted member record for ID ${existingMember.id}.`);
 
         if (avatarUrlToDelete) {
-             console.log(`Attempting to delete associated avatar: ${avatarUrlToDelete}`); // Added logging from File 2
-             ctx.waitUntil(deleteAvatarFromR2(env, avatarUrlToDelete)); // Uses File 2 deleteAvatarFromR2
+             console.log(`Attempting to delete associated avatar: ${avatarUrlToDelete}`);
+             ctx.waitUntil(deleteAvatarFromR2(env, avatarUrlToDelete));
         }
 
-       ctx.waitUntil(checkAndDeleteEmptyTeam(env, teamCode)); // Uses File 2 checkAndDeleteEmptyTeam
+       ctx.waitUntil(checkAndDeleteEmptyTeam(env, teamCode));
 
        return new Response(null, { status: 204, headers: CORS_HEADERS });
 
-    } catch (deleteProcessError: any) { // Added type any for catch error
+    } catch (deleteProcessError: any) {
         console.error(`Error during user member deletion process for ID ${existingMember.id}:`, deleteProcessError);
-        return errorResponse( // Uses File 2 errorResponse
+        return errorResponse(
            `Failed to process deletion: ${deleteProcessError instanceof Error ? deleteProcessError.message : 'Unknown error'}`,
             500,
             deleteProcessError
@@ -1176,8 +1180,8 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
 }
 
 
-// POST /api/member_song_preferences (Authenticated User) - MODIFIED to use kindeUserId (Using File 1's logic)
-async function handleSaveMemberSongPreference(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
+// POST /api/member_song_preferences (Authenticated User)
+async function handleSaveMemberSongPreference(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/member_song_preferences POST for Kinde user ID: ${kindeUserId}`);
     try {
         const payload: SaveMemberSongPreferencePayload = await request.json();
@@ -1188,22 +1192,22 @@ async function handleSaveMemberSongPreference(request: Request, env: Env, ctx: E
             .first<{ id: number }>();
 
         if (!member) {
-            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden (Uses File 2 errorResponse)
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
         }
 
         // 2. Validate payload and ensure member_id matches the authenticated user's member ID
         if (!payload.tournament_stage || !payload.song_id || !payload.selected_difficulty || payload.member_id !== member.id) {
              // Optionally allow admin to save for other members, but for user endpoint, enforce self-save
-             return errorResponse("Invalid payload or member_id mismatch.", 400); // Uses File 2 errorResponse
+             return errorResponse("Invalid payload or member_id mismatch.", 400);
         }
 
         // 3. Check if song exists
         const songExists = await env.DB.prepare("SELECT id FROM songs WHERE id = ?").bind(payload.song_id).first();
         if (!songExists) {
-             return errorResponse("Invalid song_id.", 400); // Uses File 2 errorResponse
+             return errorResponse("Invalid song_id.", 400);
         }
 
-        // 4. Insert/Update preference (using ON CONFLICT) (Using File 1's ON CONFLICT clause)
+        // 4. Insert/Update preference (using ON CONFLICT)
         const stmt = env.DB.prepare(
             `INSERT INTO member_song_preferences (member_id, tournament_stage, song_id, selected_difficulty, created_at)
              VALUES (?, ?, ?, ?, ?)
@@ -1250,17 +1254,17 @@ async function handleSaveMemberSongPreference(request: Request, env: Env, ctx: E
             return jsonResponse(newPreference, 201);
         } else {
             console.error("Worker: Failed to save member song preference:", result.error);
-            return errorResponse(result.error || "Failed to save preference."); // Uses File 2 errorResponse
+            return errorResponse(result.error || "Failed to save preference.");
         }
 
-    } catch (e: any) { // Added type any for catch error
+    } catch (e: any) {
         console.error("Worker: Exception saving member song preference:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
-// GET /api/member_song_preferences (Authenticated User) - MODIFIED to use kindeUserId (Using File 1's logic and path)
-async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
+// GET /api/member_song_preferences (Authenticated User)
+async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/member_song_preferences GET for Kinde user ID: ${kindeUserId}`);
     try {
         const url = new URL(request.url);
@@ -1273,7 +1277,7 @@ async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx:
             .first<{ id: number }>();
 
         if (!member) {
-            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden (Uses File 2 errorResponse)
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
         }
 
         // 2. Validate parameters and ensure member_id matches the authenticated user's member ID
@@ -1283,10 +1287,10 @@ async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx:
         if (!stage || memberIdNum === null || isNaN(memberIdNum) || memberIdNum !== member.id) {
              // Optionally allow admin to fetch for other members, but for user endpoint, enforce self-fetch
              // NOTE: File 1's logic here does NOT allow admin to fetch others. Keeping File 1's logic.
-             return errorResponse("Invalid parameters or member_id mismatch.", 400); // Uses File 2 errorResponse
+             return errorResponse("Invalid parameters or member_id mismatch.", 400);
         }
 
-        // 3. Fetch preferences (Using File 1's query with stage filter)
+        // 3. Fetch preferences
         const query = `
             SELECT
                 msp.*,
@@ -1311,17 +1315,17 @@ async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx:
 
         return jsonResponse(preferencesWithDetails);
 
-    } catch (e: any) { // Added type any for catch error
+    } catch (e: any) {
         console.error("Worker: Failed to get member song preferences:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
 
 // --- Admin API Endpoints (Require Admin Auth) ---
 
-// GET /api/admin/members (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 1 logic)
-async function handleAdminFetchMembers(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
+// GET /api/admin/members (Admin Only)
+async function handleAdminFetchMembers(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Admin user ${kindeUserId} fetching all members...`);
     // Admin authentication and isAdmin check already done by middleware
 
@@ -1332,35 +1336,45 @@ async function handleAdminFetchMembers(request: Request, env: Env, ctx: Executio
         ).all<Member>();
         return jsonResponse({ members: allMembers.results || [] }, 200);
     } catch (e: any) {
-        console.error(`Admin user ${kindeUserId}: Failed to list all members:`, e); // Added logging from File 2
-        return errorResponse('Failed to fetch all members from database.', 500, e); // Uses File 2 errorResponse
+        console.error(`Admin user ${kindeUserId}: Failed to list all members:`, e);
+        return errorResponse('Failed to fetch all members from database.', 500, e);
     }
 }
 
-// GET /api/admin/members/:id (Admin Only) (From File 2)
-async function handleAdminGetMemberById(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, memberId: number): Promise<Response> { // Added memberId parameter
+// GET /api/admin/members/:id (Admin Only)
+async function handleAdminGetMemberById(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const memberId = parseInt(parts[4], 10); // /api/admin/members/:id -> parts[4]
     console.log(`Admin user ${kindeUserId} handling /api/admin/members/:id request for member ID ${memberId}...`);
-    // memberId is already parsed and passed by the router
+
+    if (isNaN(memberId)) {
+        return errorResponse("Invalid member ID in path", 400);
+    }
     try {
         const member = await env.DB.prepare("SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?").bind(memberId).first<Member>();
         if (member) {
             return jsonResponse(member);
         } else {
-            return errorResponse("Member not found", 404); // Uses File 2 errorResponse
+            return errorResponse("Member not found", 404);
         }
     } catch (e: any) {
-        console.error(`Admin user ${kindeUserId}: Failed to get member ${memberId}:`, e); // Added logging from File 2
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        console.error(`Admin user ${kindeUserId}: Failed to get member ${memberId}:`, e);
+        return errorResponse(e.message);
     }
 }
 
-// PATCH /api/admin/members/:id (Admin Only) (From File 2)
-async function handleAdminPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, targetMemberId: number): Promise<Response> { // Added targetMemberId parameter
+// PATCH /api/admin/members/:id (Admin Only)
+async function handleAdminPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const targetMemberId = parseInt(parts[4], 10); // /api/admin/members/:id -> parts[4]
     console.log(`Admin user ${kindeUserId} handling /api/admin/members/:id PATCH request for member ID ${targetMemberId}...`);
-    // targetMemberId is already parsed and passed by the router
+
+    if (isNaN(targetMemberId)) {
+        return errorResponse("Invalid member ID in path", 400);
+    }
 
     let formData: FormData;
-    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); }
 
     // --- Find Member ---
     const existingMember = await env.DB.prepare('SELECT * FROM members WHERE id = ?')
@@ -1368,7 +1382,7 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
         .first<Member>();
 
     if (!existingMember) {
-        return errorResponse('Member not found.', 404); // Uses File 2 errorResponse
+        return errorResponse('Member not found.', 404);
     }
 
     // --- Prepare Updates ---
@@ -1393,14 +1407,14 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
 
     // --- Validate and Add Fields to Update ---
     if (newTeamCode !== undefined && newTeamCode !== existingMember.team_code) {
-        if (newTeamCode.length !== 4 || isNaN(parseInt(newTeamCode))) { return errorResponse('Invalid new team code format.', 400); } // Uses File 2 errorResponse
+        if (newTeamCode.length !== 4 || isNaN(parseInt(newTeamCode))) { return errorResponse('Invalid new team code format.', 400); }
         // Check if new team exists
         const teamExists = await env.DB.prepare('SELECT 1 FROM teams WHERE code = ? LIMIT 1').bind(newTeamCode).first();
-        if (!teamExists) { return errorResponse(`New team code ${newTeamCode} not found.`, 404); } // Uses File 2 errorResponse
+        if (!teamExists) { return errorResponse(`New team code ${newTeamCode} not found.`, 404); }
         updates.team_code = newTeamCode; setClauses.push('team_code = ?'); params.push(newTeamCode);
     }
     if (newColor !== undefined && newColor !== existingMember.color) {
-        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400); // Uses File 2 errorResponse
+        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400);
         // Check color conflict in the *new* team if teamCode is changing, otherwise in the current team
         const targetTeamCodeForConflictCheck = newTeamCode !== undefined ? newTeamCode : existingMember.team_code;
          const colorConflict = await env.DB.prepare(
@@ -1408,11 +1422,11 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
             )
             .bind(targetTeamCodeForConflictCheck, newColor, existingMember.id)
             .first();
-        if (colorConflict) { return errorResponse(`The color '${newColor}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); } // Uses File 2 errorResponse
+        if (colorConflict) { return errorResponse(`The color '${newColor}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); }
         updates.color = newColor; setClauses.push('color = ?'); params.push(newColor);
     }
    if (newJob !== undefined && newJob !== existingMember.job) {
-        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400); // Uses File 2 errorResponse
+        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400);
         // Check job conflict in the *new* team if teamCode is changing, otherwise in the current team
         const targetTeamCodeForConflictCheck = newTeamCode !== undefined ? newTeamCode : existingMember.team_code;
          const jobConflict = await env.DB.prepare(
@@ -1420,31 +1434,31 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
             )
             .bind(targetTeamCodeForConflictCheck, newJob, existingMember.id)
             .first();
-        if (jobConflict) { return errorResponse(`The job '${newJob}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); } // Uses File 2 errorResponse
+        if (jobConflict) { return errorResponse(`The job '${newJob}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); }
         updates.job = newJob; setClauses.push('job = ?'); params.push(newJob);
    }
     if (newMaimaiId !== undefined && newMaimaiId !== existingMember.maimai_id) {
-        if (newMaimaiId.length === 0 || newMaimaiId.length > 13) { return errorResponse('Maimai ID must be between 1 and 13 characters.', 400); } // Uses File 2 errorResponse
+        if (newMaimaiId.length === 0 || newMaimaiId.length > 13) { return errorResponse('Maimai ID must be between 1 and 13 characters.', 400); }
         // Check if new Maimai ID is already taken by someone else
         const maimaiIdConflict = await env.DB.prepare('SELECT 1 FROM members WHERE maimai_id = ? AND id != ? LIMIT 1').bind(newMaimaiId, existingMember.id).first();
-        if (maimaiIdConflict) { return errorResponse(`Maimai ID ${newMaimaiId} is already registered.`, 409); } // Uses File 2 errorResponse
+        if (maimaiIdConflict) { return errorResponse(`Maimai ID ${newMaimaiId} is already registered.`, 409); }
         updates.maimai_id = newMaimaiId; setClauses.push('maimai_id = ?'); params.push(newMaimaiId);
     }
     if (newNickname !== undefined && newNickname !== existingMember.nickname) {
-        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); } // Uses File 2 errorResponse
+        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); }
         updates.nickname = newNickname; setClauses.push('nickname = ?'); params.push(newNickname);
     }
     if (newQqNumber !== undefined && newQqNumber !== existingMember.qq_number) {
-        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); } // Uses File 2 errorResponse
+        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); }
         updates.qq_number = newQqNumber; setClauses.push('qq_number = ?'); params.push(newQqNumber);
     }
     if (newKindeUserId !== undefined && newKindeUserId !== existingMember.kinde_user_id) {
          // Allow setting to null/empty string to unlink Kinde account
-         if (newKindeUserId !== null && newKindeUserId !== '' && newKindeUserId.length > 100) { return errorResponse('Kinde User ID is too long.', 400); } // Uses File 2 errorResponse
+         if (newKindeUserId !== null && newKindeUserId !== '' && newKindeUserId.length > 100) { return errorResponse('Kinde User ID is too long.', 400); }
          // Check if new Kinde User ID is already linked to another member
          if (newKindeUserId !== null && newKindeUserId !== '') {
               const kindeIdConflict = await env.DB.prepare('SELECT 1 FROM members WHERE kinde_user_id = ? AND id != ? LIMIT 1').bind(newKindeUserId, existingMember.id).first();
-              if (kindeIdConflict) { return errorResponse(`Kinde User ID ${newKindeUserId} is already linked to another member.`, 409); } // Uses File 2 errorResponse
+              if (kindeIdConflict) { return errorResponse(`Kinde User ID ${newKindeUserId} is already linked to another member.`, 409); }
          }
          updates.kinde_user_id = newKindeUserId === '' ? null : newKindeUserId; setClauses.push('kinde_user_id = ?'); params.push(updates.kinde_user_id);
     }
@@ -1461,16 +1475,16 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
          newAvatarUrl = null; updates.avatar_url = null;
          if (existingMember.avatar_url) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     } else if (newAvatarFile instanceof File) {
-       console.log(`Admin processing new avatar file upload for member ID ${existingMember.id}`); // Added logging from File 2
-       // Use Kinde User ID or Maimai ID for avatar path (From File 2)
+       console.log(`Admin processing new avatar file upload for member ID ${existingMember.id}`);
+       // Use Kinde User ID or Maimai ID for avatar path
        const idForAvatarPath = existingMember.kinde_user_id || existingMember.maimai_id || targetMemberId.toString(); // Fallback to internal ID
        if (!idForAvatarPath) {
             console.error(`Cannot determine identifier for avatar path for member ID ${existingMember.id}`);
-            return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
+            return errorResponse('Failed to determine avatar identifier.', 500);
        }
        const targetTeamCodeForAvatar = newTeamCode !== undefined ? newTeamCode : existingMember.team_code; // Use new team code if changing
-       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, targetTeamCodeForAvatar); // Uses File 2 uploadAvatar
-       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); } // Uses File 2 errorResponse
+       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, targetTeamCodeForAvatar);
+       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); }
        newAvatarUrl = uploadedUrl; updates.avatar_url = newAvatarUrl;
        if (existingMember.avatar_url && existingMember.avatar_url !== newAvatarUrl) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     }
@@ -1485,29 +1499,29 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
    params.push(existingMember.id); // Use internal ID for WHERE clause
 
    const updateQuery = `UPDATE members SET ${setClauses.join(', ')} WHERE id = ?`;
-   console.log(`Executing admin update for ID ${existingMember.id}: ${updateQuery} with params: ${JSON.stringify(params.slice(0, -1))}`); // Added logging from File 2
+   console.log(`Executing admin update for ID ${existingMember.id}: ${updateQuery} with params: ${JSON.stringify(params.slice(0, -1))}`);
 
    try {
-       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); } // Uses File 2 deleteAvatarFromR2
+       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); }
 
         const updateResult = await env.DB.prepare(updateQuery).bind(...params).run();
 
         if (!updateResult.success) {
-             console.error(`Admin update member database operation failed for ID ${existingMember.id}:`, updateResult.error); // Added logging from File 2
+             console.error(`Admin update member database operation failed for ID ${existingMember.id}:`, updateResult.error);
               if (updateResult.error?.includes('UNIQUE constraint failed')) {
-                   return errorResponse(`Update failed due to a conflict (color, job, maimai ID, or Kinde ID). Please check values.`, 409); // Uses File 2 errorResponse
+                   return errorResponse(`Update failed due to a conflict (color, job, maimai ID, or Kinde ID). Please check values.`, 409);
               }
-             return errorResponse('Failed to update member information due to a database issue.', 500); // Uses File 2 errorResponse
+             return errorResponse('Failed to update member information due to a database issue.', 500);
         }
 
         if (updateResult.meta.changes === 0) {
-            console.warn(`Admin update query executed for ID ${existingMember.id} but no rows were changed.`); // Added logging from File 2
+            console.warn(`Admin update query executed for ID ${existingMember.id} but no rows were changed.`);
             const checkExists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?').bind(existingMember.id).first();
-            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404); // Uses File 2 errorResponse
+            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404);
             return jsonResponse({ message: "No changes detected or record unchanged.", member: existingMember }, 200);
         }
 
-        console.log(`Successfully updated member ID ${existingMember.id}. Changes: ${updateResult.meta.changes}`); // Added logging from File 2
+        console.log(`Successfully updated member ID ${existingMember.id}. Changes: ${updateResult.meta.changes}`);
 
         // Fetch the *updated* member data to return
         const updatedMember = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?')
@@ -1515,15 +1529,15 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
             .first<Member>();
 
         if (!updatedMember) {
-              console.error(`Consistency issue: Member ID ${existingMember.id} updated but could not be re-fetched.`); // Added logging from File 2
-              return errorResponse('Update successful, but failed to retrieve updated data.', 500); // Uses File 2 errorResponse
+              console.error(`Consistency issue: Member ID ${existingMember.id} updated but could not be re-fetched.`);
+              return errorResponse('Update successful, but failed to retrieve updated data.', 500);
         }
 
         return jsonResponse({ success: true, message: "Information updated successfully.", member: updatedMember }, 200);
 
-   } catch (updateProcessError: any) { // Added type any for catch error
-        console.error(`Error during the admin member update process for ID ${existingMember.id}:`, updateProcessError); // Added logging from File 2
-        return errorResponse( // Uses File 2 errorResponse
+   } catch (updateProcessError: any) {
+        console.error(`Error during the admin member update process for ID ${existingMember.id}:`, updateProcessError);
+        return errorResponse(
              `Failed to process update: ${updateProcessError instanceof Error ? updateProcessError.message : 'Unknown error'}`,
              500,
              updateProcessError
@@ -1533,641 +1547,1482 @@ async function handleAdminPatchMember(request: Request, env: Env, ctx: Execution
 
 // TODO: Implement handleAdminAddMember, handleAdminDeleteMember, handleAdminUpdateSettings (These were TODOs in File 1)
 
+// Admin Add Member (Basic Implementation)
+async function handleAdminAddMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    console.log(`Admin user ${kindeUserId} handling /api/admin/members POST request...`);
+    let formData: FormData;
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format. Expected multipart/form-data.', 400, e); }
 
-// --- Tournament/Match API Handlers ---
-// POST /api/tournament_matches (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
-async function handleCreateTournamentMatch(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/tournament_matches POST request...`);
+    const teamCode = formData.get('teamCode')?.toString()?.trim();
+    const color = formData.get('color')?.toString();
+    const job = formData.get('job')?.toString();
+    const maimaiId = formData.get('maimaiId')?.toString()?.trim();
+    const nickname = formData.get('nickname')?.toString()?.trim();
+    const qqNumber = formData.get('qqNumber')?.toString()?.trim();
+    const kindeUserIdToAdd = formData.get('kindeUserId')?.toString()?.trim() || null; // Optional Kinde ID
+    const isAdmin = formData.get('isAdmin')?.toString() === 'true' ? 1 : 0; // Optional admin status
+    const avatarFile = formData.get('avatarFile');
+
+    // --- Input Validation ---
+    if (!teamCode || teamCode.length !== 4 || isNaN(parseInt(teamCode))) return errorResponse('Invalid team code.', 400);
+    if (!color || !['red', 'green', 'blue'].includes(color)) return errorResponse('Invalid color selection.', 400);
+    if (!job || !['attacker', 'defender', 'supporter'].includes(job)) return errorResponse('Invalid job selection.', 400);
+    if (!maimaiId || maimaiId.length === 0 || maimaiId.length > 13) return errorResponse('Maimai ID is required (1-13 chars).', 400);
+    if (!nickname || nickname.length === 0 || nickname.length > 50) return errorResponse('Nickname is required (1-50 chars).', 400);
+    if (!qqNumber || !/^[1-9][0-9]{4,14}$/.test(qqNumber)) return errorResponse('A valid QQ number is required.', 400);
+    if (kindeUserIdToAdd && kindeUserIdToAdd.length > 100) return errorResponse('Kinde User ID is too long.', 400);
+    // --- End Validation ---
+
     try {
-        interface SimpleCreateTournamentMatchPayload {
-            round_name: string;
-            team1_id: number | null;
-            team2_id: number | null;
-            scheduled_time?: string | null;
-        }
-        const payload: SimpleCreateTournamentMatchPayload = await request.json();
+        const checks = await env.DB.batch([
+            env.DB.prepare('SELECT 1 FROM teams WHERE code = ? LIMIT 1').bind(teamCode),
+            env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND color = ? LIMIT 1').bind(teamCode, color),
+            env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND job = ? LIMIT 1').bind(teamCode, job),
+            env.DB.prepare('SELECT 1 FROM members WHERE maimai_id = ? LIMIT 1').bind(maimaiId),
+            kindeUserIdToAdd ? env.DB.prepare('SELECT 1 FROM members WHERE kinde_user_id = ? LIMIT 1').bind(kindeUserIdToAdd) : null,
+        ].filter(Boolean)); // Filter out null if kindeUserIdToAdd is null
 
-        if (!payload.round_name || payload.team1_id === null || payload.team2_id === null) {
-             return errorResponse("Missing required fields: round_name, team1_id, team2_id", 400); // Uses File 2 errorResponse
-        } else {
-            const team1 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team1_id).first();
-            const team2 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team2_id).first();
-            if (!team1 || !team2) {
-                 return errorResponse("Invalid team1_id or team2_id", 400); // Uses File 2 errorResponse
-            } else {
-                const stmt = env.DB.prepare(
-                    `INSERT INTO tournament_matches (round_name, team1_id, team2_id, scheduled_time, status, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)`
-                );
-                const result = await stmt.bind(
-                    payload.round_name,
-                    payload.team1_id,
-                    payload.team2_id,
-                    payload.scheduled_time || null,
-                    'scheduled',
-                    new Date().toISOString(),
-                    new Date().toISOString()
-                ).run();
+        const teamExists = checks[0]?.results?.[0];
+        const colorConflict = checks[1]?.results?.[0];
+        const jobConflict = checks[2]?.results?.[0];
+        const maimaiIdConflict = checks[3]?.results?.[0];
+        const kindeIdConflict = kindeUserIdToAdd ? checks[4]?.results?.[0] : null;
 
-                if (result.success) {
-                    const newMatch = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(result.meta.last_row_id).first<TournamentMatch>();
-                    return jsonResponse(newMatch, 201);
-                } else {
-                    console.error("Worker: Failed to create tournament match:", result.error);
-                    return errorResponse(result.error || "Failed to create match."); // Uses File 2 errorResponse
-                }
+        if (!teamExists) return errorResponse(`Team with code ${teamCode} not found.`, 404);
+        if (colorConflict) return errorResponse(`The color '${color}' is already taken in team ${teamCode}.`, 409);
+        if (jobConflict) return errorResponse(`The job '${job}' is already taken in team ${teamCode}.`, 409);
+        if (maimaiIdConflict) return errorResponse(`Maimai ID ${maimaiId} is already registered.`, 409);
+        if (kindeIdConflict) return errorResponse(`Kinde User ID ${kindeUserIdToAdd} is already linked to another member.`, 409);
+
+        let avatarUrl: string | null = null;
+        if (avatarFile instanceof File) {
+            const idForAvatarPath = kindeUserIdToAdd || maimaiId;
+            if (!idForAvatarPath) {
+                 console.error(`Cannot determine identifier for avatar path for new member (maimaiId: ${maimaiId})`);
+                 return errorResponse('Failed to determine avatar identifier.', 500);
+            }
+            avatarUrl = await uploadAvatar(env, avatarFile, idForAvatarPath, teamCode);
+            if (avatarUrl === null) {
+                console.warn(`Admin add member blocked for ${maimaiId}: Avatar upload failed.`);
+                return errorResponse('Failed to upload avatar. Member not added.', 500);
             }
         }
-    } catch (e: any) { // Added type any for catch error
+
+        const now = Math.floor(Date.now() / 1000);
+        const insertResult = await env.DB.prepare(
+            'INSERT INTO members (team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, kinde_user_id, is_admin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(teamCode, color, job, maimaiId, nickname, qqNumber, avatarUrl, now, kindeUserIdToAdd, isAdmin)
+        .run();
+
+        if (!insertResult.success) {
+            console.error('Admin add member database insert failed:', insertResult.error);
+            return errorResponse(insertResult.error || 'Failed to add member due to a database issue.', 500);
+        }
+
+        const newMemberId = insertResult.meta.last_row_id;
+        const newMember = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?')
+            .bind(newMemberId)
+            .first<Member>();
+
+        return jsonResponse({ success: true, message: "Member added successfully.", member: newMember }, 201);
+
+    } catch (e: any) {
+        console.error('Error during admin add member process:', e);
+        return errorResponse(e.message, 500, e);
+    }
+}
+
+// Admin Delete Member (Basic Implementation)
+async function handleAdminDeleteMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    console.log(`Admin user ${kindeUserId} handling /api/admin/members/:id DELETE request...`);
+    const parts = new URL(request.url).pathname.split('/');
+    const targetMemberId = parseInt(parts[4], 10); // /api/admin/members/:id -> parts[4]
+
+    if (isNaN(targetMemberId)) {
+        return errorResponse("Invalid member ID in path", 400);
+    }
+
+    try {
+        // Fetch member details before deleting to get avatar_url and team_code
+        const existingMember = await env.DB.prepare('SELECT id, team_code, avatar_url FROM members WHERE id = ?')
+            .bind(targetMemberId)
+            .first<{ id: number, team_code: string, avatar_url?: string | null }>();
+
+        if (!existingMember) {
+            return errorResponse('Member not found.', 404);
+        }
+
+        const teamCode = existingMember.team_code;
+        const avatarUrlToDelete = existingMember.avatar_url;
+
+        console.log(`Admin user ${kindeUserId} attempting to delete member ID ${targetMemberId}`);
+        const deleteResult = await env.DB.prepare('DELETE FROM members WHERE id = ?')
+            .bind(targetMemberId)
+            .run();
+
+        if (!deleteResult.success) {
+            console.error(`Admin delete member database operation failed for ID ${targetMemberId}:`, deleteResult.error);
+            return errorResponse(deleteResult.error || 'Failed to delete member due to a database issue.', 500);
+        }
+        if (deleteResult.meta.changes === 0) {
+             console.warn(`Admin delete query executed for ID ${targetMemberId} but no rows changed.`);
+             return errorResponse('Member not found or already deleted.', 404);
+        }
+        console.log(`Successfully deleted member record for ID ${targetMemberId}.`);
+
+        if (avatarUrlToDelete) {
+             console.log(`Admin user ${kindeUserId} attempting to delete associated avatar: ${avatarUrlToDelete}`);
+             ctx.waitUntil(deleteAvatarFromR2(env, avatarUrlToDelete));
+        }
+
+        // Check and delete the team if it becomes empty
+        ctx.waitUntil(checkAndDeleteEmptyTeam(env, teamCode));
+
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+    } catch (e: any) {
+        console.error(`Error during admin member deletion process for ID ${targetMemberId}:`, e);
+        return errorResponse(e.message, 500, e);
+    }
+}
+
+// Admin Update Settings (Placeholder)
+async function handleAdminUpdateSettings(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    console.log(`Admin user ${kindeUserId} handling /api/admin/settings PATCH request...`);
+    try {
+        const payload: { key: string; value: string } = await request.json();
+
+        if (!payload || typeof payload.key !== 'string' || typeof payload.value !== 'string') {
+            return errorResponse('Invalid payload format. Expected { key: string, value: string }.', 400);
+        }
+
+        // Only allow updating specific settings, e.g., 'collection_paused'
+        const allowedSettings = ['collection_paused'];
+        if (!allowedSettings.includes(payload.key)) {
+            return errorResponse(`Updating setting '${payload.key}' is not allowed via this endpoint.`, 403);
+        }
+
+        const now = new Date().toISOString();
+        const result = await env.DB.prepare(
+            `INSERT INTO settings (key, value, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = excluded.updated_at
+            `
+        )
+        .bind(payload.key, payload.value, now)
+        .run();
+
+        if (result.success) {
+            console.log(`Admin user ${kindeUserId} updated setting '${payload.key}' to '${payload.value}'.`);
+            return jsonResponse({ success: true, message: "Setting updated successfully." }, 200);
+        } else {
+            console.error(`Admin user ${kindeUserId}: Failed to update setting '${payload.key}':`, result.error);
+            return errorResponse(result.error || "Failed to update setting.", 500);
+        }
+
+    } catch (e: any) {
+        console.error(`Error during admin update settings process:`, e);
+        return errorResponse(e.message, 500, e);
+    }
+}
+
+
+// --- Tournament/Match API Handlers ---
+// POST /api/tournament_matches (Admin Only)
+async function handleCreateTournamentMatch(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    console.log(`Admin user ${kindeUserId} handling /api/tournament_matches POST request...`);
+    try {
+        const payload: CreateTournamentMatchPayload = await request.json();
+
+        if (!payload.round_name || payload.team1_id === null || payload.team2_id === null) {
+            return errorResponse('Missing required fields: round_name, team1_id, team2_id.', 400);
+        }
+        if (payload.team1_id === payload.team2_id) {
+             return errorResponse('Team 1 and Team 2 cannot be the same.', 400);
+        }
+
+        // Verify teams exist
+        const teamsExist = await env.DB.batch([
+            env.DB.prepare('SELECT 1 FROM teams WHERE id = ? LIMIT 1').bind(payload.team1_id),
+            env.DB.prepare('SELECT 1 FROM teams WHERE id = ? LIMIT 1').bind(payload.team2_id),
+        ]);
+        if (!teamsExist[0].results[0] || !teamsExist[1].results[0]) {
+             return errorResponse('One or both teams not found.', 404);
+        }
+
+
+        const now = new Date().toISOString();
+        const insertResult = await env.DB.prepare(
+            'INSERT INTO tournament_matches (round_name, team1_id, team2_id, status, scheduled_time, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(
+            payload.round_name,
+            payload.team1_id,
+            payload.team2_id,
+            'pending_song_confirmation', // Initial status is pending song selection/confirmation
+            payload.scheduled_time || null,
+            now,
+            now
+        )
+        .run();
+
+        if (!insertResult.success) {
+            console.error("Worker: Failed to create tournament match:", insertResult.error);
+            return errorResponse(insertResult.error || "Failed to create match.");
+        }
+
+        const newMatchId = insertResult.meta.last_row_id;
+        // Fetch the newly created match with denormalized names for response
+        const newMatch = await env.DB.prepare(`
+            SELECT
+                tm.*,
+                t1.name AS team1_name,
+                t2.name AS team2_name
+            FROM tournament_matches tm
+            JOIN teams t1 ON tm.team1_id = t1.id
+            JOIN teams t2 ON tm.team2_id = t2.id
+            WHERE tm.id = ?
+        `).bind(newMatchId).first<TournamentMatch>();
+
+
+        return jsonResponse(newMatch, 201);
+
+    } catch (e: any) {
         console.error("Worker: Exception creating tournament match:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
-// PUT /api/tournament_matches/:id/confirm_setup (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
-async function handleConfirmMatchSetup(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, tournamentMatchId: number): Promise<Response> { // Added ctx parameter for middleware compatibility
-     console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${tournamentMatchId}/confirm_setup PUT request...`);
-     try {
-         interface ConfirmSetupPayload {
-             team1_player_order: number[];
-             team2_player_order: number[];
-             match_song_list: MatchSong[];
+// GET /api/tournament_matches (Public)
+async function handleFetchTournamentMatches(request: Request, env: Env): Promise<Response> {
+    console.log('Handling /api/tournament_matches request...');
+    try {
+        // Fetch matches with joined team names
+        const query = `
+            SELECT
+                tm.*,
+                t1.name AS team1_name,
+                t2.name AS team2_name,
+                tw.name AS winner_team_name
+            FROM tournament_matches tm
+            JOIN teams t1 ON tm.team1_id = t1.id
+            JOIN teams t2 ON tm.team2_id = t2.id
+            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+            ORDER BY tm.scheduled_time DESC, tm.created_at DESC
+        `;
+        const { results } = await env.DB.prepare(query).all<TournamentMatch>();
+
+        // Parse JSON fields and add fullCoverUrl for match_song_list
+        const matchesWithParsedData = results.map(match => {
+            const parsedMatch = { ...match } as TournamentMatch; // Copy to avoid modifying original result object
+            if (match.team1_player_order_json) {
+                try { parsedMatch.team1_player_order = JSON.parse(match.team1_player_order_json); } catch (e) { console.error(`Failed to parse team1_player_order_json for match ${match.id}`, e); }
+            }
+            if (match.team2_player_order_json) {
+                try { parsedMatch.team2_player_order = JSON.parse(match.team2_player_order_json); } catch (e) { console.error(`Failed to parse team2_player_order_json for match ${match.id}`, e); }
+            }
+            if (match.match_song_list_json) {
+                try {
+                    const songList = JSON.parse(match.match_song_list_json) as MatchSong[];
+                    // Add fullCoverUrl to each song in the list
+                    parsedMatch.match_song_list = songList.map(song => ({
+                        ...song,
+                        fullCoverUrl: song.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                            ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
+                            : undefined,
+                    }));
+                } catch (e) { console.error(`Failed to parse match_song_list_json for match ${match.id}`, e); }
+            }
+            // Remove raw JSON fields from the response data
+            delete (parsedMatch as any).team1_player_order_json;
+            delete (parsedMatch as any).team2_player_order_json;
+            delete (parsedMatch as any).match_song_list_json;
+
+            return parsedMatch;
+        });
+
+
+        return jsonResponse(matchesWithParsedData);
+    } catch (e: any) {
+        console.error("Worker: Failed to list tournament matches:", e);
+        return errorResponse(e.message);
+    }
+}
+
+// PUT /api/tournament_matches/:id/confirm_setup (Admin Only)
+async function handleConfirmMatchSetup(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parseInt(parts[3], 10); // /api/tournament_matches/:id/confirm_setup -> parts[3]
+    console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${matchId}/confirm_setup PUT request...`);
+
+    if (isNaN(matchId)) {
+        return errorResponse("Invalid match ID in path", 400);
+    }
+
+    try {
+        const payload: ConfirmMatchSetupPayload = await request.json();
+
+        // Basic validation
+        if (!Array.isArray(payload.team1_player_order) || !Array.isArray(payload.team2_player_order) || !Array.isArray(payload.match_song_list)) {
+            return errorResponse('Invalid payload format.', 400);
+        }
+        // TODO: Add more robust validation for player IDs and song list structure/content
+
+        // Fetch the match to ensure it exists and is in a state that allows setup
+        const match = await env.DB.prepare('SELECT id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
+        if (!match) {
+            return errorResponse('Match not found.', 404);
+        }
+        // Allow setup if status is scheduled or pending_song_confirmation
+        if (match.status !== 'scheduled' && match.status !== 'pending_song_confirmation') {
+             return errorResponse(`Match status is "${match.status}", cannot confirm setup.`, 400);
+        }
+
+
+        // Update the tournament_matches record with the manually confirmed setup
+        const now = new Date().toISOString();
+        const updateResult = await env.DB.prepare(
+            'UPDATE tournament_matches SET team1_player_order_json = ?, team2_player_order_json = ?, match_song_list_json = ?, status = ?, updated_at = ? WHERE id = ?'
+        )
+        .bind(
+            JSON.stringify(payload.team1_player_order),
+            JSON.stringify(payload.team2_player_order),
+            JSON.stringify(payload.match_song_list),
+            'ready_to_start', // Status changes to ready_to_start after setup
+            now,
+            matchId
+        )
+        .run();
+
+        if (!updateResult.success) {
+            console.error("Worker: Failed to confirm match setup:", updateResult.error);
+            return errorResponse(updateResult.error || "Failed to confirm match setup.");
+        }
+
+        // Fetch the updated match record with denormalized names for response
+        const updatedMatch = await env.DB.prepare(`
+            SELECT
+                tm.*,
+                t1.name AS team1_name,
+                t2.name AS team2_name,
+                tw.name AS winner_team_name
+            FROM tournament_matches tm
+            JOIN teams t1 ON tm.team1_id = t1.id
+            JOIN teams t2 ON tm.team2_id = t2.id
+            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+            WHERE tm.id = ?
+        `).bind(matchId).first<TournamentMatch>();
+
+         if (updatedMatch) {
+             // Parse JSON fields and add fullCoverUrl for match_song_list
+             if (updatedMatch.team1_player_order_json) {
+                 try { updatedMatch.team1_player_order = JSON.parse(updatedMatch.team1_player_order_json); } catch (e) { console.error(`Failed to parse team1_player_order_json for match ${updatedMatch.id}`, e); }
+             }
+             if (updatedMatch.team2_player_order_json) {
+                 try { updatedMatch.team2_player_order = JSON.parse(updatedMatch.team2_player_order_json); } catch (e) { console.error(`Failed to parse team2_player_order_json for match ${updatedMatch.id}`, e); }
+             }
+             if (updatedMatch.match_song_list_json) {
+                 try {
+                     const songList = JSON.parse(updatedMatch.match_song_list_json) as MatchSong[];
+                     // Add fullCoverUrl to each song in the list
+                     updatedMatch.match_song_list = songList.map(song => ({
+                         ...song,
+                         fullCoverUrl: song.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                             ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
+                             : undefined,
+                     }));
+                 } catch (e) { console.error(`Failed to parse match_song_list_json for match ${updatedMatch.id}`, e); }
+             }
+             // Remove raw JSON fields from the response data
+             delete (updatedMatch as any).team1_player_order_json;
+             delete (updatedMatch as any).team2_player_order_json;
+             delete (updatedMatch as any).match_song_list_json;
          }
-         const payload: ConfirmSetupPayload = await request.json();
 
-         if (!Array.isArray(payload.team1_player_order) || !Array.isArray(payload.team2_player_order) || !Array.isArray(payload.match_song_list) || payload.team1_player_order.length === 0 || payload.team2_player_order.length === 0 || payload.match_song_list.length === 0) {
-             return errorResponse("Invalid payload: player orders and song list must be non-empty arrays.", 400); // Uses File 2 errorResponse
-         } else {
-             const match = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<TournamentMatch>();
-             if (!match) {
-                 return errorResponse("Tournament match not found.", 404); // Uses File 2 errorResponse
-             } else if (match.status !== 'scheduled' && match.status !== 'pending_song_confirmation') {
-                  return errorResponse(`Match status is '${match.status}'. Must be 'scheduled' or 'pending_song_confirmation' to confirm setup.`, 400); // Uses File 2 errorResponse
-             } else {
-                 const stmt = env.DB.prepare(
-                     `UPDATE tournament_matches SET
-                        team1_player_order_json = ?,
-                        team2_player_order_json = ?,
-                        match_song_list_json = ?,
-                        status = ?,
-                        updated_at = ?
-                      WHERE id = ?`
-                 );
-                 const result = await stmt.bind(
-                     JSON.stringify(payload.team1_player_order),
-                     JSON.stringify(payload.team2_player_order),
-                     JSON.stringify(payload.match_song_list),
-                     'ready_to_start',
-                     new Date().toISOString(),
-                     tournamentMatchId
-                 ).run();
 
-                 if (result.success) {
-                     const updatedMatch = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<TournamentMatch>();
-                     return jsonResponse(updatedMatch);
+        return jsonResponse(updatedMatch, 200);
+
+    } catch (e: any) {
+        console.error("Worker: Exception confirming match setup:", e);
+        return errorResponse(e.message);
+    }
+}
+
+
+// GET /api/tournament_matches/:matchId/selection-status (Authenticated User - Changed from Public based on File 1 description needing team/member details)
+async function handleFetchMatchSelectionStatus(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parseInt(parts[4], 10); // /api/tournament_matches/:matchId/selection-status -> parts[4]
+    console.log(`Authenticated user ${kindeUserId} handling /api/tournament_matches/${matchId}/selection-status GET request...`);
+
+    if (isNaN(matchId)) {
+        return errorResponse("Invalid match ID in path", 400);
+    }
+
+    try {
+        // Fetch match details
+        const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
+        if (!match) {
+            return errorResponse('Match not found.', 404);
+        }
+
+        // Fetch teams and members for both teams
+        const [team1Result, team2Result, team1MembersResult, team2MembersResult, selectionsResult] = await env.DB.batch([
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(match.team1_id),
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(match.team2_id),
+            env.DB.prepare('SELECT id, nickname, team_code FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(match.team1_id),
+            env.DB.prepare('SELECT id, nickname, team_code FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(match.team2_id),
+            env.DB.prepare('SELECT member_id, team_id FROM match_player_selections WHERE tournament_match_id = ?').bind(matchId),
+        ]);
+
+        const team1 = team1Result.results[0] as { id: number; name: string } | undefined;
+        const team2 = team2Result.results[0] as { id: number; name: string } | undefined;
+        const team1Members = team1MembersResult.results as { id: number; nickname: string; team_code: string }[] || [];
+        const team2Members = team2MembersResult.results as { id: number; nickname: string; team_code: string }[] || [];
+        const selections = selectionsResult.results as { member_id: number; team_id: number }[] || [];
+
+        if (!team1 || !team2) {
+             // This shouldn't happen if match exists and FKs are correct, but handle defensively
+             return errorResponse('Could not retrieve team information for the match.', 500);
+        }
+
+        const team1Required = team1Members.length;
+        const team2Required = team2Members.length;
+
+        const team1Completed = selections.filter(s => s.team_id === team1.id).length;
+        const team2Completed = selections.filter(s => s.team_id === team2.id).length;
+
+        const team1SelectedMemberIds = new Set(selections.filter(s => s.team_id === team1.id).map(s => s.member_id));
+        const team2SelectedMemberIds = new Set(selections.filter(s => s.team_id === team2.id).map(s => s.member_id));
+
+        const team1MissingMembers = team1Members.filter(m => !team1SelectedMemberIds.has(m.id)).map(m => ({ id: m.id, nickname: m.nickname }));
+        const team2MissingMembers = team2Members.filter(m => !team2SelectedMemberIds.has(m.id)).map(m => ({ id: m.id, nickname: m.nickname }));
+
+        const isReadyToCompile = team1Completed === team1Required && team2Completed === team2Required;
+
+        const responseData: MatchSelectionStatus = {
+            matchId: matchId,
+            isReadyToCompile: isReadyToCompile,
+            team1Status: {
+                teamId: team1.id,
+                teamName: team1.name,
+                requiredSelections: team1Required,
+                completedSelections: team1Completed,
+                missingMembers: team1MissingMembers,
+            },
+            team2Status: {
+                teamId: team2.id,
+                teamName: team2.name,
+                requiredSelections: team2Required,
+                completedSelections: team2Completed,
+                missingMembers: team2MissingMembers,
+            },
+        };
+
+        return jsonResponse(responseData);
+
+    } catch (e: any) {
+        console.error(`Worker: Failed to get match selection status for match ${matchId}:`, e);
+        return errorResponse(e.message);
+    }
+}
+
+
+// POST /api/tournament_matches/:matchId/compile-setup (Admin Only)
+async function handleCompileMatchSetup(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parseInt(parts[4], 10); // /api/tournament_matches/:matchId/compile-setup -> parts[4]
+    console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${matchId}/compile-setup POST request...`);
+
+    if (isNaN(matchId)) {
+        return errorResponse("Invalid match ID in path", 400);
+    }
+
+    try {
+        // Fetch match details and check status
+        const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
+        if (!match) {
+            return errorResponse('Match not found.', 404);
+        }
+        if (match.status !== 'pending_song_confirmation') {
+             return errorResponse(`Match status is "${match.status}", cannot compile setup. Status must be 'pending_song_confirmation'.`, 400);
+        }
+
+        // Fetch teams and members for both teams
+        const [team1Result, team2Result, team1MembersResult, team2MembersResult, selectionsResult] = await env.DB.batch([
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(match.team1_id),
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(match.team2_id),
+            env.DB.prepare('SELECT id, nickname, team_code FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(match.team1_id),
+            env.DB.prepare('SELECT id, nickname, team_code FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(match.team2_id),
+            env.DB.prepare('SELECT mps.*, m.nickname FROM match_player_selections mps JOIN members m ON mps.member_id = m.id WHERE mps.tournament_match_id = ?').bind(matchId),
+        ]);
+
+        const team1 = team1Result.results[0] as { id: number; name: string } | undefined;
+        const team2 = team2Result.results[0] as { id: number; name: string } | undefined;
+        const team1Members = team1MembersResult.results as { id: number; nickname: string; team_code: string }[] || [];
+        const team2Members = team2MembersResult.results as { id: number; nickname: string; team_code: string }[] || [];
+        const selections = selectionsResult.results as (MatchPlayerSelection & { nickname: string })[] || [];
+
+        if (!team1 || !team2) {
+             return errorResponse('Could not retrieve team information for the match.', 500);
+        }
+
+        const team1Required = team1Members.length;
+        const team2Required = team2Members.length;
+        const completedSelectionsCount = selections.length;
+
+        if (completedSelectionsCount !== team1Required + team2Required) {
+             // Check if all members from both teams have submitted selections
+             const team1SelectedCount = selections.filter(s => s.team_id === team1.id).length;
+             const team2SelectedCount = selections.filter(s => s.team_id === team2.id).length;
+
+             if (team1SelectedCount !== team1Required || team2SelectedCount !== team2Required) {
+                 const missingTeam1 = team1Required - team1SelectedCount;
+                 const missingTeam2 = team2Required - team2SelectedCount;
+                 let errorMessage = "Cannot compile setup: Not all players have submitted their song selections.";
+                 if (missingTeam1 > 0) errorMessage += ` Team ${team1.name} is missing ${missingTeam1} selection(s).`;
+                 if (missingTeam2 > 0) errorMessage += ` Team ${team2.name} is missing ${missingTeam2} selection(s).`;
+                 return errorResponse(errorMessage, 400);
+             }
+        }
+
+        // Group and sort selections by team and order index
+        const team1Selections = selections.filter(s => s.team_id === team1.id).sort((a, b) => a.selected_order_index - b.selected_order_index);
+        const team2Selections = selections.filter(s => s.team_id === team2.id).sort((a, b) => a.selected_order_index - b.selected_order_index);
+
+        // Construct player order arrays (array of member IDs)
+        const team1PlayerOrder = team1Selections.map(s => s.member_id);
+        const team2PlayerOrder = team2Selections.map(s => s.member_id);
+
+        // Construct match song list (alternating players, then song 1/song 2)
+        const matchSongList: MatchSong[] = [];
+        const maxPlayersPerTeam = Math.max(team1Selections.length, team2Selections.length); // Should be equal if all selected
+
+        // Fetch song details for all selected songs efficiently
+        const songIds = new Set<number>();
+        selections.forEach(s => {
+            songIds.add(s.song1_id);
+            songIds.add(s.song2_id);
+        });
+        const songDetailsResult = await env.DB.prepare(`SELECT id, title, cover_filename, levels_json FROM songs WHERE id IN (${Array.from(songIds).join(',')})`).all<Song & { levels_json: string | null }>();
+        const songDetailsMap = new Map<number, Song & { levels_json: string | null }>();
+        songDetailsResult.results?.forEach(song => songDetailsMap.set(song.id, song));
+
+
+        // Add Song 1 for each player, alternating teams
+        for (let i = 0; i < maxPlayersPerTeam; i++) {
+            if (i < team1Selections.length) {
+                const selection = team1Selections[i];
+                const songDetail = songDetailsMap.get(selection.song1_id);
+                if (songDetail) {
+                    matchSongList.push({
+                        song_id: selection.song1_id,
+                        difficulty: selection.song1_difficulty,
+                        player_id: selection.member_id,
+                        player_nickname: selection.nickname,
+                        team_id: selection.team_id,
+                        team_name: team1.name,
+                        title: songDetail.title,
+                        cover_filename: songDetail.cover_filename,
+                        parsedLevels: songDetail.levels_json ? JSON.parse(songDetail.levels_json) : undefined,
+                        fullCoverUrl: songDetail.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                            ? `${env.R2_PUBLIC_BUCKET_URL}/${songDetail.cover_filename}`
+                            : undefined,
+                    });
+                } else {
+                     console.error(`Song details not found for ID ${selection.song1_id} during compilation.`);
+                     // Decide how to handle missing song details - error or skip? Error is safer.
+                     return errorResponse(`Failed to find details for song ID ${selection.song1_id} during compilation.`, 500);
+                }
+            }
+            if (i < team2Selections.length) {
+                const selection = team2Selections[i];
+                 const songDetail = songDetailsMap.get(selection.song1_id);
+                 if (songDetail) {
+                    matchSongList.push({
+                        song_id: selection.song1_id,
+                        difficulty: selection.song1_difficulty,
+                        player_id: selection.member_id,
+                        player_nickname: selection.nickname,
+                        team_id: selection.team_id,
+                        team_name: team2.name,
+                        title: songDetail.title,
+                        cover_filename: songDetail.cover_filename,
+                        parsedLevels: songDetail.levels_json ? JSON.parse(songDetail.levels_json) : undefined,
+                        fullCoverUrl: songDetail.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                            ? `${env.R2_PUBLIC_BUCKET_URL}/${songDetail.cover_filename}`
+                            : undefined,
+                    });
                  } else {
-                     console.error("Worker: Failed to confirm match setup:", result.error);
-                     return errorResponse(result.error || "Failed to confirm setup."); // Uses File 2 errorResponse
+                     console.error(`Song details not found for ID ${selection.song1_id} during compilation.`);
+                     return errorResponse(`Failed to find details for song ID ${selection.song1_id} during compilation.`, 500);
                  }
-             }
-         }
-     } catch (e: any) { // Added type any for catch error
-         console.error(`Worker: Exception confirming match setup ${tournamentMatchId}:`, e);
-         return errorResponse(e.message); // Uses File 2 errorResponse
-     }
-}
-
-// POST /api/tournament_matches/:id/start_live (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
-async function handleStartLiveMatch(request: Request, env: Env, ctx: ExecutionContext, tournamentMatchId: number): Promise<Response> { // Added ctx parameter for middleware compatibility
-     console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${tournamentMatchId}/start_live POST request...`);
-     try {
-         const match = await env.DB.prepare(
-             `SELECT tm.*, t1.name AS team1_name, t2.name AS team2_name
-              FROM tournament_matches tm
-              JOIN teams t1 ON tm.team1_id = t1.id
-              JOIN teams t2 ON tm.team2_id = t2.id
-              WHERE tm.id = ?`
-         ).bind(tournamentMatchId).first<TournamentMatch>();
-
-         if (!match) {
-             return errorResponse("Scheduled match not found", 404); // Uses File 2 errorResponse
-         } else if (match.status === 'live' && match.match_do_id) {
-             console.log(`Worker: Match ${tournamentMatchId} is already live with DO ${match.match_do_id}. Returning existing DO ID.`);
-             return jsonResponse({ message: "Match is already live.", match_do_id: match.match_do_id });
-         } else if (match.status !== 'ready_to_start') {
-              return errorResponse(`Match status is '${match.status}'. Must be 'ready_to_start' to start live.`, 400); // Uses File 2 errorResponse
-         } else if (!match.team1_player_order_json || !match.team2_player_order_json || !match.match_song_list_json) {
-              return errorResponse("Match setup is incomplete (player order or song list missing).", 400); // Uses File 2 errorResponse
-         } else {
-             const team1 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team1_id).first<{ code: string }>();
-             const team2 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team2_id).first<{ code: string }>();
-             if (!team1 || !team2) {
-                  return errorResponse("Could not fetch team codes for members.", 500); // Uses File 2 errorResponse
-             } else {
-                 const team1Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team1.code).all<Member>();
-                 const team2Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team2.code).all<Member>();
-
-                 if (!team1Members.results || team1Members.results.length === 0 || !team2Members.results || team2Members.results.length === 0) {
-                       return errorResponse("One or both teams have no members assigned.", 400); // Uses File 2 errorResponse
-                  } else {
-                     const team1PlayerOrderIds: number[] = JSON.parse(match.team1_player_order_json);
-                     const team2PlayerOrderIds: number[] = JSON.parse(match.team2_player_order_json);
-                     const matchSongList: MatchSong[] = JSON.parse(match.match_song_list_json);
-
-                     if (!Array.isArray(team1PlayerOrderIds) || !Array.isArray(team2PlayerOrderIds) || !Array.isArray(matchSongList) || team1PlayerOrderIds.length === 0 || team2PlayerOrderIds.length === 0 || matchSongList.length === 0) {
-                          return errorResponse("Parsed setup data is invalid.", 500); // Uses File 2 errorResponse
-                     } else {
-                         const doIdString = `match-${tournamentMatchId}`;
-                         const doStub = getMatchDO(doIdString, env);
-                         const initPayload: MatchScheduleData = {
-                             tournamentMatchId: tournamentMatchId,
-                             round_name: match.round_name,
-                             team1_id: match.team1_id,
-                             team2_id: match.team2_id,
-                             team1_name: match.team1_name || 'Team A',
-                             team2_name: match.team2_name || 'Team B',
-                             team1_members: team1Members.results,
-                             team2_members: team2Members.results,
-                             team1_player_order_ids: team1PlayerOrderIds,
-                             team2_player_order_ids: team2PlayerOrderIds,
-                             match_song_list: matchSongList,
-                         };
-
-                         // Forward initialization request to the DO (Uses File 2 forwardRequestToDO with bodyData)
-                         const doResponse = await forwardRequestToDO(doIdString, env, request, '/internal/initialize-from-schedule', 'POST', initPayload);
-
-                         if (doResponse.ok) {
-                             const updateStmt = env.DB.prepare("UPDATE tournament_matches SET status = ?, match_do_id = ?, updated_at = ? WHERE id = ?");
-                             const updateResult = await updateStmt.bind('live', doIdString, new Date().toISOString(), tournamentMatchId).run();
-
-                             if (updateResult.success) {
-                                  console.log(`Worker: Tournament match ${tournamentMatchId} status updated to 'live' with DO ${doIdString}.`);
-                                  const doResult = await doResponse.json();
-                                  return jsonResponse({ message: "Match started live.", match_do_id: doIdString, do_init_result: doResult });
-                             } else {
-                                  console.error(`Worker: Failed to update tournament_matches status for ${tournamentMatchId}:`, updateResult.error);
-                                  return errorResponse(`Match started live in DO, but failed to update schedule status: ${updateResult.error}`, 500); // Uses File 2 errorResponse
-                             }
-                         } else {
-                             const errorBody = await doResponse.json();
-                             console.error(`Worker: Failed to initialize DO ${doIdString} for match ${tournamentMatchId}:`, errorBody);
-                             return errorResponse(`Failed to initialize live match in Durable Object: ${errorBody.message || errorBody.error}`, doResponse.status); // Uses File 2 errorResponse
-                         }
-                     }
-                  }
-             }
-         }
-     } catch (e: any) { // Added type any for catch error
-         console.error(`Worker: Exception starting live match ${tournamentMatchId}:`, e);
-         return errorResponse(`Exception starting live match: ${e.message}`); // Uses File 2 errorResponse
-     }
-}
-
-// Live Match DO Actions (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's versions)
-// These handlers read the body and then call forwardRequestToDO
-async function handleAdminCalculateRound(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/calculate-round POST request...`);
-    try {
-        const payload: CalculateRoundPayload = await request.json();
-        if (typeof payload.teamA_percentage !== 'number' || typeof payload.teamB_percentage !== 'number') {
-             return errorResponse("Invalid payload: teamA_percentage and teamB_percentage must be numbers.", 400); // Uses File 2 errorResponse
+            }
         }
-        // Forward the request to the DO. forwardRequestToDO will handle reading the body again.
-        // A better approach is to read the body *once* here and pass it to forwardRequestToDO.
-        // Let's modify forwardRequestToDO to accept an optional body parameter. (Already done above)
-        return forwardRequestToDO(doIdString, env, request, '/internal/calculate-round', 'POST', payload); // Uses File 2 forwardRequestToDO with bodyData
-    } catch (e: any) { // Added type any for catch error
-        console.error(`Worker: Exception processing calculate-round payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
-    }
-}
 
-async function handleAdminNextRound(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/next-round POST request...`);
-    // Forward the request to the DO (Uses File 2 forwardRequestToDO)
-    return forwardRequestToDO(doIdString, env, request, '/internal/next-round', 'POST');
-}
-
-async function handleAdminArchiveMatch(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/archive POST request...`);
-    // Forward the request to the DO (Uses File 2 forwardRequestToDO)
-    return forwardRequestToDO(doIdString, env, request, '/internal/archive-match', 'POST');
-}
-
-async function handleAdminResolveDraw(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/resolve-draw POST request...`);
-    try {
-        const payload: ResolveDrawPayload = await request.json();
-        if (payload.winner !== 'teamA' && payload.winner !== 'teamB') {
-             return errorResponse("Invalid payload: winner must be 'teamA' or 'teamB'.", 400); // Uses File 2 errorResponse
-         }
-        // Forward the request to the DO (Uses File 2 forwardRequestToDO with bodyData)
-        return forwardRequestToDO(doIdString, env, request, '/internal/resolve-draw', 'POST', payload);
-    } catch (e: any) { // Added type any for catch error
-        console.error(`Worker: Exception processing resolve-draw payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
-    }
-}
-
-async function handleAdminSelectTiebreakerSong(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
-    console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/select-tiebreaker-song POST request...`);
-    try {
-        const payload: SelectTiebreakerSongPayload = await request.json();
-        if (typeof payload.song_id !== 'number' || typeof payload.selected_difficulty !== 'string') {
-            return errorResponse("Invalid select-tiebreaker-song payload: song_id (number) and selected_difficulty (string) are required.", 400); // Uses File 2 errorResponse
+        // Add Song 2 for each player, alternating teams
+        for (let i = 0; i < maxPlayersPerTeam; i++) {
+            if (i < team1Selections.length) {
+                const selection = team1Selections[i];
+                 const songDetail = songDetailsMap.get(selection.song2_id);
+                 if (songDetail) {
+                    matchSongList.push({
+                        song_id: selection.song2_id,
+                        difficulty: selection.song2_difficulty,
+                        player_id: selection.member_id,
+                        player_nickname: selection.nickname,
+                        team_id: selection.team_id,
+                        team_name: team1.name,
+                        title: songDetail.title,
+                        cover_filename: songDetail.cover_filename,
+                        parsedLevels: songDetail.levels_json ? JSON.parse(songDetail.levels_json) : undefined,
+                        fullCoverUrl: songDetail.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                            ? `${env.R2_PUBLIC_BUCKET_URL}/${songDetail.cover_filename}`
+                            : undefined,
+                    });
+                 } else {
+                     console.error(`Song details not found for ID ${selection.song2_id} during compilation.`);
+                     return errorResponse(`Failed to find details for song ID ${selection.song2_id} during compilation.`, 500);
+                 }
+            }
+            if (i < team2Selections.length) {
+                const selection = team2Selections[i];
+                 const songDetail = songDetailsMap.get(selection.song2_id);
+                 if (songDetail) {
+                    matchSongList.push({
+                        song_id: selection.song2_id,
+                        difficulty: selection.song2_difficulty,
+                        player_id: selection.member_id,
+                        player_nickname: selection.nickname,
+                        team_id: selection.team_id,
+                        team_name: team2.name,
+                        title: songDetail.title,
+                        cover_filename: songDetail.cover_filename,
+                        parsedLevels: songDetail.levels_json ? JSON.parse(songDetail.levels_json) : undefined,
+                        fullCoverUrl: songDetail.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                            ? `${env.R2_PUBLIC_BUCKET_URL}/${songDetail.cover_filename}`
+                            : undefined,
+                    });
+                 } else {
+                     console.error(`Song details not found for ID ${selection.song2_id} during compilation.`);
+                     return errorResponse(`Failed to find details for song ID ${selection.song2_id} during compilation.`, 500);
+                 }
+            }
         }
-        // Before forwarding, fetch song details from D1 to pass to DO
-        const song = await env.DB.prepare("SELECT * FROM songs WHERE id = ?").bind(payload.song_id).first<Song>();
-        if (!song) {
-             return errorResponse(`Song with ID ${payload.song_id} not found in D1.`, 404); // Uses File 2 errorResponse
+
+
+        // Update the tournament_matches record
+        const now = new Date().toISOString();
+        const updateResult = await env.DB.prepare(
+            'UPDATE tournament_matches SET team1_player_order_json = ?, team2_player_order_json = ?, match_song_list_json = ?, status = ?, updated_at = ? WHERE id = ?'
+        )
+        .bind(
+            JSON.stringify(team1PlayerOrder),
+            JSON.stringify(team2PlayerOrder),
+            JSON.stringify(matchSongList),
+            'ready_to_start', // Status changes to ready_to_start after compilation
+            now,
+            matchId
+        )
+        .run();
+
+        if (!updateResult.success) {
+            console.error("Worker: Failed to compile match setup:", updateResult.error);
+            return errorResponse(updateResult.error || "Failed to compile match setup.");
+        }
+
+        // Fetch the updated match record to return
+        const updatedMatch = await env.DB.prepare(`
+            SELECT
+                tm.*,
+                t1.name AS team1_name,
+                t2.name AS team2_name,
+                tw.name AS winner_team_name
+            FROM tournament_matches tm
+            JOIN teams t1 ON tm.team1_id = t1.id
+            JOIN teams t2 ON tm.team2_id = t2.id
+            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+            WHERE tm.id = ?
+        `).bind(matchId).first<TournamentMatch>();
+
+         if (updatedMatch) {
+             // Parse JSON fields and add fullCoverUrl for match_song_list
+             if (updatedMatch.team1_player_order_json) {
+                 try { updatedMatch.team1_player_order = JSON.parse(updatedMatch.team1_player_order_json); } catch (e) { console.error(`Failed to parse team1_player_order_json for match ${updatedMatch.id}`, e); }
+             }
+             if (updatedMatch.team2_player_order_json) {
+                 try { parsedMatch.team2_player_order = JSON.parse(updatedMatch.team2_player_order_json); } catch (e) { console.error(`Failed to parse team2_player_order_json for match ${updatedMatch.id}`, e); }
+             }
+             if (updatedMatch.match_song_list_json) {
+                 try {
+                     const songList = JSON.parse(updatedMatch.match_song_list_json) as MatchSong[];
+                     // Add fullCoverUrl to each song in the list
+                     updatedMatch.match_song_list = songList.map(song => ({
+                         ...song,
+                         fullCoverUrl: song.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                             ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
+                             : undefined,
+                     }));
+                 } catch (e) { console.error(`Failed to parse match_song_list_json for match ${updatedMatch.id}`, e); }
+             }
+             // Remove raw JSON fields from the response data
+             delete (updatedMatch as any).team1_player_order_json;
+             delete (updatedMatch as any).team2_player_order_json;
+             delete (updatedMatch as any).match_song_list_json;
          }
-         // Pass song details along with selection to DO
-        const doPayload = { song_id: payload.song_id, selected_difficulty: payload.selected_difficulty, song_details: song };
-        // Forward the request to the DO (Uses File 2 forwardRequestToDO with bodyData)
-        return forwardRequestToDO(doIdString, env, request, '/internal/select-tiebreaker-song', 'POST', doPayload);
-    } catch (e: any) { // Added type any for catch error
-        console.error(`Worker: Exception processing select-tiebreaker-song payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
+
+
+        const responseData: CompileMatchSetupResponse = {
+            success: true,
+            message: "Match setup compiled successfully.",
+            tournamentMatch: updatedMatch,
+        };
+
+        return jsonResponse(responseData);
+
+    } catch (e: any) {
+        console.error(`Worker: Exception compiling match setup for match ${matchId}:`, e);
+        return errorResponse(e.message);
     }
 }
 
 
-// --- Song Endpoints (Public) (Using File 1's logic) ---
-// handleFetchSongs (GET /api/songs) (From File 1)
+// GET /api/member/match-selection/:matchId (Authenticated User)
+async function handleFetchUserMatchSelectionData(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parseInt(parts[4], 10); // /api/member/match-selection/:matchId -> parts[4]
+    console.log(`Authenticated user ${kindeUserId} handling /api/member/match-selection/${matchId} GET request...`);
+
+    if (isNaN(matchId)) {
+        return errorResponse("Invalid match ID in path", 400);
+    }
+
+    try {
+        // 1. Find the member ID for the authenticated Kinde user
+        const member = await env.DB.prepare('SELECT id, team_code FROM members WHERE kinde_user_id = ? LIMIT 1')
+            .bind(kindeUserId)
+            .first<{ id: number; team_code: string }>();
+
+        if (!member) {
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
+        }
+
+        // 2. Fetch match details
+        const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
+        if (!match) {
+            return errorResponse('Match not found.', 404);
+        }
+
+        // 3. Determine user's team and opponent team IDs
+        let myTeamId: number | undefined;
+        let opponentTeamId: number | undefined;
+        if (match.team1_id === member.team_code) { // Assuming team_code matches team.id for simplicity based on schema
+             myTeamId = match.team1_id;
+             opponentTeamId = match.team2_id;
+        } else if (match.team2_id === member.team_code) { // Assuming team_code matches team.id
+             myTeamId = match.team2_id;
+             opponentTeamId = match.team1_id;
+        } else {
+             // User's team is not in this match
+             return errorResponse("Your team is not participating in this match.", 403);
+        }
+
+        // 4. Fetch teams, members, user's selection, and all selections for occupied indices
+        const [myTeamResult, opponentTeamResult, myTeamMembersResult, opponentTeamMembersResult, mySelectionResult, allSelectionsResult] = await env.DB.batch([
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(myTeamId),
+            env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(opponentTeamId),
+            env.DB.prepare('SELECT id, nickname, team_code, color, job, maimai_id, avatar_url FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(myTeamId),
+            env.DB.prepare('SELECT id, nickname, team_code, color, job, maimai_id, avatar_url FROM members WHERE team_code = (SELECT code FROM teams WHERE id = ? LIMIT 1)').bind(opponentTeamId),
+            env.DB.prepare('SELECT * FROM match_player_selections WHERE tournament_match_id = ? AND member_id = ? LIMIT 1').bind(matchId, member.id),
+            env.DB.prepare('SELECT mps.team_id, mps.selected_order_index, mps.member_id, m.nickname FROM match_player_selections mps JOIN members m ON mps.member_id = m.id WHERE mps.tournament_match_id = ?').bind(matchId),
+        ]);
+
+        const myTeam = myTeamResult.results[0] as Team | undefined;
+        const opponentTeam = opponentTeamResult.results[0] as Team | undefined;
+        const myTeamMembers = myTeamMembersResult.results as Member[] || [];
+        const opponentTeamMembers = opponentTeamMembersResult.results as Member[] || [];
+        const mySelection = mySelectionResult.results[0] as MatchPlayerSelection | undefined;
+        const allSelections = allSelectionsResult.results as { team_id: number; selected_order_index: number; member_id: number; nickname: string }[] || [];
+
+        if (!myTeam || !opponentTeam) {
+             // Should not happen if previous team check passed, but defensive
+             return errorResponse('Could not retrieve team details.', 500);
+        }
+
+        // Determine available slots count (assuming 3v3 based on member count check in join handler)
+        const availableOrderSlotsCount = Math.max(myTeamMembers.length, opponentTeamMembers.length); // Use actual member count
+
+        // Format occupied indices
+        const occupiedOrderIndices = allSelections.map(s => ({
+            team_id: s.team_id,
+            selected_order_index: s.selected_order_index,
+            member_id: s.member_id,
+            member_nickname: s.nickname,
+        }));
+
+        // Construct response data
+        const responseData: FetchUserMatchSelectionData = {
+            match: match,
+            myTeam: myTeam,
+            opponentTeam: opponentTeam,
+            myTeamMembers: myTeamMembers,
+            opponentTeamMembers: opponentTeamMembers,
+            mySelection: mySelection || null,
+            occupiedOrderIndices: occupiedOrderIndices,
+            availableOrderSlotsCount: availableOrderSlotsCount,
+        };
+
+        return jsonResponse(responseData);
+
+    } catch (e: any) {
+        console.error(`Worker: Failed to fetch user match selection data for match ${matchId} and user ${kindeUserId}:`, e);
+        return errorResponse(e.message);
+    }
+}
+
+
+// POST /api/member/match-selection/:matchId (Authenticated User)
+async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parseInt(parts[4], 10); // /api/member/match-selection/:matchId -> parts[4]
+    console.log(`Authenticated user ${kindeUserId} handling /api/member/match-selection/${matchId} POST request...`);
+
+    if (isNaN(matchId)) {
+        return errorResponse("Invalid match ID in path", 400);
+    }
+
+    try {
+        const payload: SaveMatchPlayerSelectionPayload = await request.json();
+
+        // 1. Find the member ID and team code for the authenticated Kinde user
+        const member = await env.DB.prepare('SELECT id, team_code FROM members WHERE kinde_user_id = ? LIMIT 1')
+            .bind(kindeUserId)
+            .first<{ id: number; team_code: string }>();
+
+        if (!member) {
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
+        }
+
+        // 2. Fetch match details and determine user's team ID
+        const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
+        if (!match) {
+            return errorResponse('Match not found.', 404);
+        }
+
+        let myTeamId: number | undefined;
+        if (match.team1_id === member.team_code) { // Assuming team_code matches team.id
+             myTeamId = match.team1_id;
+        } else if (match.team2_id === member.team_code) { // Assuming team_code matches team.id
+             myTeamId = match.team2_id;
+        } else {
+             // User's team is not in this match
+             return errorResponse("Your team is not participating in this match.", 403);
+        }
+
+        // 3. Validate payload
+        if (
+            payload.song1_id === undefined || payload.song1_id === null ||
+            payload.song1_difficulty === undefined || payload.song1_difficulty === null ||
+            payload.song2_id === undefined || payload.song2_id === null ||
+            payload.song2_difficulty === undefined || payload.song2_difficulty === null ||
+            payload.selected_order_index === undefined || payload.selected_order_index === null ||
+            isNaN(payload.song1_id) || isNaN(payload.song2_id) || isNaN(payload.selected_order_index)
+        ) {
+             return errorResponse("Invalid or missing song/order data in payload.", 400);
+        }
+
+        // Basic range check for order index (assuming 3v3, indices 0, 1, 2)
+        if (payload.selected_order_index < 0 || payload.selected_order_index > 2) {
+             return errorResponse("Invalid selected_order_index. Must be 0, 1, or 2.", 400);
+        }
+
+        // Check if songs exist
+        const songsExist = await env.DB.batch([
+            env.DB.prepare("SELECT id FROM songs WHERE id = ? LIMIT 1").bind(payload.song1_id),
+            env.DB.prepare("SELECT id FROM songs WHERE id = ? LIMIT 1").bind(payload.song2_id),
+        ]);
+        if (!songsExist[0].results[0] || !songsExist[1].results[0]) {
+             return errorResponse("One or both selected songs not found.", 400);
+        }
+
+        // 4. Check for existing selection by this member for this match
+        const existingSelection = await env.DB.prepare('SELECT id FROM match_player_selections WHERE tournament_match_id = ? AND member_id = ? LIMIT 1')
+            .bind(matchId, member.id)
+            .first<{ id: number }>();
+
+        // 5. Check if the selected order index is already taken by another member in this team
+        const orderIndexConflict = await env.DB.prepare('SELECT member_id FROM match_player_selections WHERE tournament_match_id = ? AND team_id = ? AND selected_order_index = ? AND member_id != ? LIMIT 1')
+            .bind(matchId, myTeamId, payload.selected_order_index, member.id) // Exclude the current member's potential existing selection
+            .first<{ member_id: number }>();
+
+        if (orderIndexConflict) {
+             // Fetch the nickname of the member who took the slot
+             const conflictingMember = await env.DB.prepare('SELECT nickname FROM members WHERE id = ? LIMIT 1').bind(orderIndexConflict.member_id).first<{ nickname: string }>();
+             const conflictingMemberName = conflictingMember?.nickname || '另一位队员';
+             return errorResponse(`Order slot ${payload.selected_order_index + 1} is already taken by ${conflictingMemberName} in your team.`, 409);
+        }
+
+        const now = new Date().toISOString();
+        let result;
+
+        if (existingSelection) {
+            // Update existing selection
+            console.log(`Updating existing selection for member ${member.id} in match ${matchId}`);
+            result = await env.DB.prepare(
+                `UPDATE match_player_selections
+                 SET song1_id = ?, song1_difficulty = ?, song2_id = ?, song2_difficulty = ?, selected_order_index = ?, updated_at = ?
+                 WHERE id = ?`
+            )
+            .bind(
+                payload.song1_id,
+                payload.song1_difficulty,
+                payload.song2_id,
+                payload.song2_difficulty,
+                payload.selected_order_index,
+                now,
+                existingSelection.id
+            )
+            .run();
+        } else {
+            // Insert new selection
+            console.log(`Inserting new selection for member ${member.id} in match ${matchId}`);
+            result = await env.DB.prepare(
+                `INSERT INTO match_player_selections (tournament_match_id, member_id, team_id, song1_id, song1_difficulty, song2_id, song2_difficulty, selected_order_index, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .bind(
+                matchId,
+                member.id,
+                myTeamId,
+                payload.song1_id,
+                payload.song1_difficulty,
+                payload.song2_id,
+                payload.song2_difficulty,
+                payload.selected_order_index,
+                now,
+                now
+            )
+            .run();
+        }
+
+
+        if (result.success) {
+            // Fetch the saved selection to return
+            const savedSelectionId = existingSelection ? existingSelection.id : result.meta.last_row_id;
+            const savedSelection = await env.DB.prepare('SELECT * FROM match_player_selections WHERE id = ? LIMIT 1').bind(savedSelectionId).first<MatchPlayerSelection>();
+
+            return jsonResponse({ success: true, message: "Selection saved successfully.", selection: savedSelection }, existingSelection ? 200 : 201);
+        } else {
+            console.error("Worker: Failed to save match player selection:", result.error);
+            // Check for unique constraint errors specifically
+            if (result.error?.includes('UNIQUE constraint failed: match_player_selections.tournament_match_id, match_player_selections.member_id')) {
+                 return errorResponse("You have already submitted a selection for this match.", 409);
+            }
+             if (result.error?.includes('UNIQUE constraint failed: match_player_selections.tournament_match_id, match_player_selections.team_id, match_player_selections.selected_order_index')) {
+                 // This case should ideally be caught by the explicit check above, but include defensively
+                 return errorResponse(`The selected order index ${payload.selected_order_index + 1} is already taken by another member in your team.`, 409);
+            }
+            return errorResponse(result.error || "Failed to save selection due to a database issue.", 500);
+        }
+
+    } catch (e: any) {
+        console.error(`Worker: Exception saving match player selection for match ${matchId} and user ${kindeUserId}:`, e);
+        return errorResponse(e.message);
+    }
+}
+
+
+// --- Songs API Handlers ---
+// GET /api/songs (Public)
 async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/songs request...');
     try {
         const url = new URL(request.url);
         const page = parseInt(url.searchParams.get('page') || '1', 10);
-        const limit = parseInt(url.searchParams.get('limit') || '20', 10);
-        const offset = (page - 1) * limit;
+        const pageSize = parseInt(url.searchParams.get('pageSize') || '50', 10);
+        const offset = (page - 1) * pageSize;
 
-        let baseQuery = "FROM songs WHERE 1=1";
-        const params: (string | number)[] = [];
-        const countParams: (string | number)[] = [];
+        const titleFilter = url.searchParams.get('title');
+        const levelFilter = url.searchParams.get('level'); // e.g., '13', '13+'
+        const difficultyFilter = url.searchParams.get('difficulty'); // e.g., 'M', 'E'
 
-        const category = url.searchParams.get('category');
-        if (category) { baseQuery += " AND category = ?"; params.push(category); countParams.push(category); }
-        const type = url.searchParams.get('type');
-         if (type) { baseQuery += " AND type = ?"; params.push(type); countParams.push(type); }
-         const search = url.searchParams.get('search');
-         if (search) { baseQuery += " AND title LIKE ?"; params.push(`%${search}%`); countParams.push(`%${search}%`); }
+        let whereClauses: string[] = [];
+        let params: (string | number)[] = [];
 
-         const countQuery = `SELECT COUNT(*) as total ${baseQuery}`;
-         // Using SELECT * as in File 1, relies on DB schema having necessary columns
-         const dataQuery = `SELECT * ${baseQuery} ORDER BY title ASC LIMIT ? OFFSET ?`;
-         params.push(limit, offset);
+        if (titleFilter) {
+            whereClauses.push("title LIKE ?");
+            params.push(`%${titleFilter}%`);
+        }
+        if (levelFilter) {
+            // Levels are stored in JSON, need to query based on parsed JSON
+            // This is complex in D1 SQL. A simpler approach for basic filtering
+            // might involve fetching all and filtering in worker, or using full-text search if available.
+            // For now, let's assume levels_json contains a key matching the difficulty and a value matching the level.
+            // Example: levels_json = '{"E": 10.5, "M": 13.0, "R": 14.0}'
+            // We need to find songs where levels_json contains a level matching levelFilter for *any* difficulty,
+            // OR for a specific difficulty if difficultyFilter is also present.
+            // D1 doesn't have JSON_EXTRACT or similar functions easily queryable in WHERE.
+            // A workaround is to fetch all and filter, or rely on simpler filters.
+            // Let's implement a basic filter that checks if the level string appears in the JSON string.
+            // This is NOT accurate for specific difficulties/levels but might work for simple cases.
+            // A better approach requires a different schema or more advanced D1 features.
+            // For now, let's skip complex JSON filtering in SQL and only apply title filter in DB.
+            console.warn("Complex JSON filtering for song levels/difficulties is not fully supported in D1 SQL WHERE clauses. Filtering will be basic or done in worker.");
+            // If we must filter in SQL, it would look something like:
+            // WHERE json_extract(levels_json, '$.M') = 13.0 OR json_extract(levels_json, '$.E') = 10.5 etc.
+            // This is hard to build dynamically. Let's stick to title filter in SQL for pagination.
+            // We will filter by level/difficulty *after* fetching the page.
+        }
 
-        const countStmt = env.DB.prepare(countQuery).bind(...countParams);
-        const dataStmt = env.DB.prepare(dataQuery).bind(...params);
 
-        const [{ total }, { results }] = await Promise.all([
-            countStmt.first<{ total: number }>(),
-            dataStmt.all<Song>() // Assuming Song type matches SELECT * results
+        let countQuery = "SELECT COUNT(*) as count FROM songs";
+        let dataQuery = "SELECT id, title, artist, genre, bpm, release_date, version, cover_filename, levels_json FROM songs";
+
+        if (whereClauses.length > 0) {
+            countQuery += " WHERE " + whereClauses.join(" AND ");
+            dataQuery += " WHERE " + whereClauses.join(" AND ");
+        }
+
+        dataQuery += " ORDER BY title ASC LIMIT ? OFFSET ?";
+        const dataParams = [...params, pageSize, offset];
+
+        console.log("Executing song count query:", countQuery, params);
+        console.log("Executing song data query:", dataQuery, dataParams);
+
+        const [countResult, dataResult] = await env.DB.batch([
+            env.DB.prepare(countQuery).bind(...params),
+            env.DB.prepare(dataQuery).bind(...dataParams),
         ]);
 
-        const songsWithDetails = results.map((song) => {
-            if (!song) return null;
-            // Need to ensure 'levels_json' and 'cover_filename' exist in DB for this mapping
-            // Cast to any to access properties that might not be strictly in the base Song type if SELECT * returns more
-            const parsedLevels = (song as any).levels_json ? JSON.parse((song as any).levels_json) as SongLevel : undefined;
-            const fullCoverUrl = (song as any).cover_filename && env.R2_PUBLIC_BUCKET_URL
-                ? `${env.R2_PUBLIC_BUCKET_URL}/${(song as any).cover_filename}`
+        const totalItems = (countResult.results[0] as { count: number })?.count || 0;
+        const songs = dataResult.results as (Song & { levels_json: string | null })[] || [];
+
+        // Post-process songs to parse levels_json and add fullCoverUrl
+        const processedSongs = songs.map(song => {
+            const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) as SongLevel : undefined;
+            const fullCoverUrl = song.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
                 : undefined;
-             // Explicitly include fields expected by frontend, assuming SELECT * returns them
-             // If 'artist' is NOT in your DB, this will be undefined, which is fine if frontend handles it.
-             return {
-                 id: song.id,
-                 title: song.title,
-                 artist: (song as any).artist, // Assuming 'artist' is returned by SELECT * (if it exists)
-                 genre: (song as any).genre,   // Assuming 'genre' is returned by SELECT *
-                 version: (song as any).version, // Assuming 'version' is returned by SELECT *
-                 bpm: (song as any).bpm,       // Assuming 'bpm' is returned by SELECT *
-                 parsedLevels: parsedLevels,
-                 fullCoverUrl: fullCoverUrl,
-                 // Add other fields from your Song type if needed and returned by SELECT *
+            const { levels_json, ...rest } = song; // Remove raw JSON field
+            return { ...rest, parsedLevels, fullCoverUrl };
+        });
+
+        // Apply level/difficulty filter in worker if needed (less efficient for large datasets)
+        let filteredSongs = processedSongs;
+        if (levelFilter || difficultyFilter) {
+             filteredSongs = processedSongs.filter(song => {
+                 const levels = song.parsedLevels;
+                 if (!levels) return false;
+
+                 let levelMatch = true;
+                 if (levelFilter) {
+                     // Check if the level string matches any level value for any difficulty
+                     levelMatch = Object.values(levels).some(level => {
+                         if (typeof level === 'number') {
+                             // Handle levels like 13.0, 13.5
+                             return level.toFixed(1) === levelFilter;
+                         }
+                         return false; // Only filter on numeric levels
+                     });
+                 }
+
+                 let difficultyMatch = true;
+                 if (difficultyFilter) {
+                     // Check if the difficulty exists and has a level
+                     difficultyMatch = levels.hasOwnProperty(difficultyFilter);
+                 }
+
+                 // If both filters are present, require both to match
+                 if (levelFilter && difficultyFilter) {
+                      // This is still not perfect. It checks if the level string exists *anywhere* AND the difficulty exists.
+                      // It doesn't check if the *specific level* exists for the *specific difficulty*.
+                      // A proper implementation needs schema changes or better JSON querying.
+                      // For now, let's just check if the difficulty exists AND the level string is present in the JSON string representation.
+                      // This is a weak filter but avoids complex D1 queries.
+                      const levelValueForDifficulty = levels[difficultyFilter as keyof SongLevel];
+                      if (typeof levelValueForDifficulty === 'number') {
+                           return levelValueForDifficulty.toFixed(1) === levelFilter;
+                      }
+                      return false; // No level for this difficulty
+                 }
+
+
+                 return levelMatch && difficultyMatch;
+             });
+             // Note: Pagination was applied *before* this filtering.
+             // For accurate pagination with these filters, filtering must happen first, then pagination.
+             // This would require fetching ALL songs, filtering, then slicing, which is inefficient.
+             // A better approach is needed for production if these filters are critical.
+             // For this implementation, the pagination is based on the DB query *before* worker-side filtering.
+             // This means the totalItems count and pagination info might be misleading if filters are applied.
+             // Let's adjust: fetch all, filter, then paginate in worker. This is simpler to implement correctly.
+             console.warn("Fetching all songs to apply level/difficulty filters in worker. This may be inefficient.");
+
+             const allSongsResult = await env.DB.prepare(dataQuery.replace(/ LIMIT \? OFFSET \?/, '')).bind(...params).all<(Song & { levels_json: string | null })>();
+             const allProcessedSongs = allSongsResult.results?.map(song => {
+                 const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) as SongLevel : undefined;
+                 const fullCoverUrl = song.cover_filename && env.R2_PUBLIC_BUCKET_URL
+                     ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
+                     : undefined;
+                 const { levels_json, ...rest } = song;
+                 return { ...rest, parsedLevels, fullCoverUrl };
+             }) || [];
+
+             filteredSongs = allProcessedSongs.filter(song => {
+                 const levels = song.parsedLevels;
+                 if (!levels) return false;
+
+                 let levelMatch = true;
+                 if (levelFilter) {
+                     levelMatch = Object.values(levels).some(level => typeof level === 'number' && level.toFixed(1) === levelFilter);
+                 }
+
+                 let difficultyMatch = true;
+                 if (difficultyFilter) {
+                     difficultyMatch = levels.hasOwnProperty(difficultyFilter);
+                 }
+
+                 if (levelFilter && difficultyFilter) {
+                      const levelValueForDifficulty = levels[difficultyFilter as keyof SongLevel];
+                      return typeof levelValueForDifficulty === 'number' && levelValueForDifficulty.toFixed(1) === levelFilter;
+                 }
+
+                 return levelMatch && difficultyMatch;
+             });
+
+             // Now paginate the filtered results
+             const paginatedSongs = filteredSongs.slice(offset, offset + pageSize);
+             const totalFilteredItems = filteredSongs.length;
+
+             const paginationInfo: PaginationInfo = {
+                 currentPage: page,
+                 pageSize: pageSize,
+                 totalItems: totalFilteredItems, // Total AFTER filtering
+                 totalPages: Math.ceil(totalFilteredItems / pageSize),
              };
-        }).filter(song => song !== null) as Song[]; // Cast back to Song[]
 
-        const pagination: PaginationInfo = {
-            currentPage: page,
-            pageSize: limit,
-            totalItems: total ?? 0,
-            totalPages: Math.ceil((total ?? 0) / limit)
-        };
+             const responseData: SongsApiResponseData = {
+                 songs: paginatedSongs,
+                 pagination: paginationInfo,
+             };
 
-        return jsonResponse<SongsApiResponseData>({ songs: songsWithDetails, pagination: pagination });
+             return jsonResponse(responseData);
+
+        } else {
+             // No level/difficulty filter, use DB pagination directly
+             const paginationInfo: PaginationInfo = {
+                 currentPage: page,
+                 pageSize: pageSize,
+                 totalItems: totalItems, // Total BEFORE filtering
+                 totalPages: Math.ceil(totalItems / pageSize),
+             };
+
+             const responseData: SongsApiResponseData = {
+                 songs: filteredSongs, // This is processedSongs here
+                 pagination: paginationInfo,
+             };
+
+             return jsonResponse(responseData);
+        }
+
 
     } catch (e: any) {
         console.error("Worker: Failed to list songs:", e);
-        if (e.cause) { console.error("Worker: D1 Error Cause:", e.cause); }
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        return errorResponse(e.message);
     }
 }
 
-// handleFetchSongFilterOptions (GET /api/songs/filters) (From File 1)
-async function handleFetchSongFilterOptions(request: Request, env: Env): Promise<Response> {
+// GET /api/songs/filters (Public)
+async function handleFetchSongFilters(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/songs/filters request...');
     try {
-        // File 1 only fetches category and type
-        const categoryQuery = "SELECT DISTINCT category FROM songs WHERE category IS NOT NULL AND category != '' ORDER BY category";
-        const typeQuery = "SELECT DISTINCT type FROM songs WHERE type IS NOT NULL AND type != '' ORDER BY type";
+        // Fetch all unique levels and difficulties from the levels_json column
+        // This is tricky with D1's limited JSON querying.
+        // A simple approach is to fetch all songs and aggregate the levels/difficulties in the worker.
+        console.warn("Fetching all songs to aggregate levels/difficulties for filters. This may be inefficient.");
+        const allSongsResult = await env.DB.prepare("SELECT levels_json FROM songs WHERE levels_json IS NOT NULL").all<{ levels_json: string | null }>();
 
-        const categoryStmt = env.DB.prepare(categoryQuery);
-        const typeStmt = env.DB.prepare(typeQuery);
+        const uniqueLevels = new Set<string>();
+        const uniqueDifficulties = new Set<string>(); // e.g., 'E', 'M', 'R', 'A', 'L'
 
-        const [{ results: categories }, { results: types }] = await Promise.all([
-            categoryStmt.all<{ category: string }>(),
-            typeStmt.all<{ type: string }>()
-        ]);
-
-        const categoryList = categories.map(c => c.category).filter(Boolean);
-        const typeList = types.map(t => t.type).filter(Boolean);
-
-        // File 1's response structure for filters
-        return jsonResponse<SongFiltersApiResponseData>({ categories: categoryList, types: typeList });
-
-    } catch (e: any) {
-        console.error("Worker: Failed to get song filter options:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
-    }
-}
-
-
-// handleFetchTournamentMatches (GET /api/tournament_matches) (Public) (From File 1/2 - same)
-async function handleFetchTournamentMatches(request: Request, env: Env): Promise<Response> {
-    console.log('Handling /api/tournament_matches request...');
-    try {
-        let query = `
-            SELECT
-                tm.*,
-                t1.code AS team1_code,
-                t1.name AS team1_name,
-                t2.code AS team2_code,
-                t2.name AS team2_name,
-                tw.code AS winner_team_code,
-                tw.name AS winner_team_name
-            FROM tournament_matches tm
-            JOIN teams t1 ON tm.team1_id = t1.id
-            JOIN teams t2 ON tm.team2_id = t2.id
-            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
-            ORDER BY tm.created_at DESC
-        `;
-
-        const { results } = await env.DB.prepare(query).all<TournamentMatch & { team1_player_order_json?: string | null; team2_player_order_json?: string | null; match_song_list_json?: string | null; }>();
-
-        const matchesWithParsedData = results.map(match => ({
-            ...match,
-            team1_player_order: match.team1_player_order_json ? JSON.parse(match.team1_player_order_json) as number[] : null,
-            team2_player_order: match.team2_player_order_json ? JSON.parse(match.team2_player_order_json) as number[] : null,
-            match_song_list: match.match_song_list_json ? JSON.parse(match.match_song_list_json) as MatchSong[] : null,
-        }));
-
-        return jsonResponse(matchesWithParsedData);
-
-    } catch (e: any) {
-        console.error("Worker: Failed to list tournament matches:", e);
-        if (e.cause) { console.error("Worker: D1 Error Cause:", e.cause); }
-        return errorResponse(e.message); // Uses File 2 errorResponse
-    }
-}
-
-// handleFetchMatchHistory (GET /api/match_history) (Public) (From File 1/2 - same)
-async function handleFetchMatchHistory(request: Request, env: Env): Promise<Response> {
-    console.log('Handling /api/match_history request...');
-    try {
-        const matchesQuery = `
-            SELECT
-                tm.id,
-                tm.round_name,
-                tm.scheduled_time,
-                tm.status,
-                tm.final_score_team1,
-                tm.final_score_team2,
-                t1.name AS team1_name,
-                t2.name AS team2_name,
-                tw.name AS winner_team_name
-            FROM tournament_matches tm
-            JOIN teams t1 ON tm.team1_id = t1.id
-            JOIN teams t2 ON tm.team2_id = t2.id
-            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
-            WHERE tm.status IN ('completed', 'archived')
-            ORDER BY tm.scheduled_time DESC, tm.created_at DESC;
-        `;
-        const { results } = await env.DB.prepare(matchesQuery).all<MatchHistoryMatch>(); // Use MatchHistoryMatch type
-
-        const historyPromises = results.map(async match => {
-            const roundsQuery = `
-                SELECT
-                    mrh.*,
-                    s.title AS song_title,
-                    s.cover_filename AS cover_filename,
-                    t_picker.name AS picker_team_name,
-                    m_picker.nickname AS picker_member_nickname,
-                    m1.nickname AS team1_member_nickname,
-                    m2.nickname AS team2_member_nickname
-                FROM match_rounds_history mrh
-                LEFT JOIN songs s ON mrh.song_id = s.id
-                LEFT JOIN teams t_picker ON mrh.picker_team_id = t_picker.id
-                LEFT JOIN members m_picker ON mrh.picker_member_id = m_picker.id
-                LEFT JOIN members m1 ON mrh.team1_member_id = m1.id
-                LEFT JOIN members m2 ON mrh.team2_member_id = m2.id
-                WHERE mrh.tournament_match_id = ?
-                ORDER BY mrh.round_number_in_match ASC;
-            `;
-            const { results: rounds } = await env.DB.prepare(roundsQuery).bind(match.id).all<MatchHistoryRound & { round_summary_json: string | null; }>(); // Use MatchHistoryRound type
-
-            const roundsWithParsedData = rounds.map(round => ({
-                ...round,
-                round_summary: round.round_summary_json ? JSON.parse(round.round_summary_json) as RoundSummary : null,
-                fullCoverUrl: round.cover_filename && env.R2_PUBLIC_BUCKET_URL
-                   ? `${env.R2_PUBLIC_BUCKET_URL}/${round.cover_filename}`
-                   : undefined,
-            }));
-
-            return {
-                ...match,
-                rounds: roundsWithParsedData,
-            };
+        allSongsResult.results?.forEach(song => {
+            try {
+                const levels = JSON.parse(song.levels_json || '{}') as SongLevel;
+                Object.entries(levels).forEach(([difficulty, level]) => {
+                    if (typeof level === 'number') {
+                        uniqueLevels.add(level.toFixed(1)); // Add level as string (e.g., "13.0", "13.5")
+                    }
+                    uniqueDifficulties.add(difficulty); // Add difficulty key (e.g., "M")
+                });
+            } catch (e) {
+                console.error("Failed to parse levels_json for filter aggregation:", song.levels_json, e);
+            }
         });
 
-        const matchHistory = await Promise.all(historyPromises);
+        const sortedLevels = Array.from(uniqueLevels).sort((a, b) => parseFloat(a) - parseFloat(b));
+        const sortedDifficulties = Array.from(uniqueDifficulties).sort(); // Alphabetical sort for difficulties
 
-        return jsonResponse(matchHistory);
+        const responseData: SongFiltersApiResponseData = {
+            levels: sortedLevels,
+            difficulties: sortedDifficulties,
+        };
+
+        return jsonResponse(responseData);
 
     } catch (e: any) {
-        console.error("Worker: Failed to fetch match history:", e);
-        return errorResponse(e.message); // Uses File 2 errorResponse
+        console.error("Worker: Failed to fetch song filters:", e);
+        return errorResponse(e.message);
     }
 }
 
 
-// --- Worker Entry Point (The Router) ---
+// --- Match DO API Handlers ---
+// POST /api/matches/:matchId/calculate-round (Admin Only)
+async function handleCalculateRound(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parts[3]; // /api/matches/:matchId/calculate-round -> parts[3]
+    console.log(`Admin user ${kindeUserId} forwarding calculate-round to DO ${matchId}...`);
+    // Forward the request to the specific Match DO instance
+    return forwardRequestToDO(matchId, env, request, '/calculate-round', 'POST');
+}
+
+// POST /api/matches/:matchId/resolve-draw (Admin Only)
+async function handleResolveDraw(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parts[3]; // /api/matches/:matchId/resolve-draw -> parts[3]
+    console.log(`Admin user ${kindeUserId} forwarding resolve-draw to DO ${matchId}...`);
+    // Forward the request to the specific Match DO instance
+    return forwardRequestToDO(matchId, env, request, '/resolve-draw', 'POST');
+}
+
+// POST /api/matches/:matchId/select-tiebreaker-song (Admin Only)
+async function handleSelectTiebreakerSong(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parts[3]; // /api/matches/:matchId/select-tiebreaker-song -> parts[3]
+    console.log(`Admin user ${kindeUserId} forwarding select-tiebreaker-song to DO ${matchId}...`);
+    // Forward the request to the specific Match DO instance
+    return forwardRequestToDO(matchId, env, request, '/select-tiebreaker-song', 'POST');
+}
+
+// GET /api/matches/:matchId/state (Public)
+async function handleGetMatchState(request: Request, env: Env): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parts[3]; // /api/matches/:matchId/state -> parts[3]
+    console.log(`Handling /api/matches/${matchId}/state GET request...`);
+    // Forward the request to the specific Match DO instance
+    return forwardRequestToDO(matchId, env, request, '/state', 'GET');
+}
+
+// GET /api/matches/:matchId/history (Public)
+async function handleGetMatchHistory(request: Request, env: Env): Promise<Response> {
+    const parts = new URL(request.url).pathname.split('/');
+    const matchId = parts[3]; // /api/matches/:matchId/history -> parts[3]
+    console.log(`Handling /api/matches/${matchId}/history GET request...`);
+    // Forward the request to the specific Match DO instance
+    return forwardRequestToDO(matchId, env, request, '/history', 'GET');
+}
+
+
+// --- Main Worker Fetch Handler ---
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url);
+        const path = url.pathname;
         const method = request.method;
-        const pathname = url.pathname;
 
-        // Handle CORS preflight requests (From File 1/2 - same)
+        console.log(`Received request: ${method} ${path}`);
+
+        // Handle CORS preflight requests
         if (method === 'OPTIONS') {
-            return new Response(null, { headers: CORS_HEADERS });
+            return new Response(null, { status: 204, headers: CORS_HEADERS });
         }
 
-        let responseFromRoute: Response;
-
-        // --- Public API Endpoints (No Auth Required) ---
-        if (method === 'GET' && pathname === '/api/settings') {
-            responseFromRoute = await handleGetSettings(request, env);
-        } else if (method === 'POST' && pathname === '/api/kinde/callback') {
-            // Kinde Callback (From File 2)
-            responseFromRoute = await handleKindeCallback(request, env, ctx);
-        } else if (method === 'GET' && pathname === '/api/logout') {
-             // Kinde Logout (From File 2)
-             responseFromRoute = await handleLogout(request, env);
-        } else if (method === 'POST' && pathname === '/api/teams/check') {
-            responseFromRoute = await handleCheckTeam(request, env);
-        } else if (method === 'POST' && pathname === '/api/teams/create') {
-            responseFromRoute = await handleCreateTeam(request, env);
-        } else if (method === 'GET' && pathname.match(/^\/api\/teams\/[0-9]{4}$/)) {
-             responseFromRoute = await handleGetTeamByCode(request, env);
-        } else if (method === 'GET' && pathname === '/api/songs') {
-             // Song List (From File 1 logic)
-             responseFromRoute = await handleFetchSongs(request, env);
-        } else if (method === 'GET' && pathname === '/api/songs/filters') {
-             // Song Filters (From File 1 logic)
-             responseFromRoute = await handleFetchSongFilterOptions(request, env);
-        } else if (method === 'GET' && pathname === '/api/tournament_matches') {
-             responseFromRoute = await handleFetchTournamentMatches(request, env);
-        } else if (method === 'GET' && pathname === '/api/match_history') {
-             responseFromRoute = await handleFetchMatchHistory(request, env);
+        // --- Public Routes ---
+        if (path === '/api/settings' && method === 'GET') {
+            return handleGetSettings(request, env);
         }
-        // Live Match State and WebSocket might be public view (From File 1/2 - same logic)
-        else if (method === 'GET' && pathname.match(/^\/api\/live-match\/[^/]+\/state$/)) {
-             const doIdString = pathname.split('/')[3];
-             // Uses File 2 forwardRequestToDO
-             responseFromRoute = await forwardRequestToDO(doIdString, env, request, '/state', 'GET');
-        } else if (method === 'GET' && pathname.match(/^\/api\/live-match\/[^/]+\/websocket$/)) {
-             const doIdString = pathname.split('/')[3];
-             const doStub = getMatchDO(doIdString, env);
-             const doUrl = new URL(request.url);
-             doUrl.pathname = '/websocket';
-             // WebSocket forwarding needs direct response return
-             responseFromRoute = await doStub.fetch(doUrl.toString(), request);
+        if (path === '/api/kinde/callback' && method === 'POST') {
+            return handleKindeCallback(request, env, ctx);
         }
-        // Public GET for individual members (by ID) (From File 1/2 - same)
-        else if (method === 'GET' && pathname.match(/^\/api\/members\/\d+$/)) {
-             responseFromRoute = await handleGetMemberById(request, env);
+        if (path === '/api/logout' && method === 'GET') {
+            return handleLogout(request, env);
         }
-        // Public GET for members list (can filter by team_code) (From File 1/2 - same)
-        else if (method === 'GET' && pathname === '/api/members') {
-             responseFromRoute = await handleFetchMembers(request, env);
+        if (path === '/api/teams' && method === 'GET') {
+            return handleFetchTeams(request, env);
+        }
+        if (path.startsWith('/api/teams/') && path.split('/').length === 4 && method === 'GET') {
+             // Matches /api/teams/:code
+             return handleGetTeamByCode(request, env);
+        }
+        if (path === '/api/teams/check' && method === 'POST') {
+            return handleCheckTeam(request, env);
+        }
+        if (path === '/api/teams/create' && method === 'POST') {
+            return handleCreateTeam(request, env);
+        }
+        if (path === '/api/members' && method === 'GET') {
+            // Can include ?team_code=...
+            return handleFetchMembers(request, env);
+        }
+        if (path.startsWith('/api/members/') && path.split('/').length === 4 && method === 'GET') {
+             // Matches /api/members/:id
+             return handleGetMemberById(request, env);
+        }
+        if (path === '/api/songs' && method === 'GET') {
+            // Can include pagination and filters
+            return handleFetchSongs(request, env);
+        }
+        if (path === '/api/songs/filters' && method === 'GET') {
+            return handleFetchSongFilters(request, env);
+        }
+        // Public Match DO routes
+        if (path.startsWith('/api/matches/') && path.endsWith('/state') && path.split('/').length === 5 && method === 'GET') {
+             // Matches /api/matches/:matchId/state
+             return handleGetMatchState(request, env);
+        }
+        if (path.startsWith('/api/matches/') && path.endsWith('/history') && path.split('/').length === 5 && method === 'GET') {
+             // Matches /api/matches/:matchId/history
+             return handleGetMatchHistory(request, env);
         }
 
 
-        // --- Authenticated User API Endpoints (Require Kinde Auth) ---
-        // Use authMiddleware (From File 2) to protect these routes
-        else if (method === 'GET' && pathname === '/api/members/me') {
-            // Get authenticated user's member info (Using File 2 authMiddleware, File 1 logic)
-            responseFromRoute = await authMiddleware(request, env, ctx, handleFetchMe);
-        } else if (method === 'POST' && pathname === '/api/teams/join') {
-            // Join team (Using File 2 authMiddleware, File 2 logic)
-            responseFromRoute = await authMiddleware(request, env, ctx, handleJoinTeam);
-        } else if (method === 'PATCH' && pathname.match(/^\/api\/members\/[^/]+$/)) { // Match /api/members/:maimaiId
-             // User update member (Using File 2 authMiddleware, File 2 logic)
-             responseFromRoute = await authMiddleware(request, env, ctx, handleUserPatchMember);
-        } else if (method === 'DELETE' && pathname.match(/^\/api\/members\/[^/]+$/)) { // Match /api/members/:maimaiId
-             // User delete member (Using File 2 authMiddleware, File 2 logic)
-             responseFromRoute = await authMiddleware(request, env, ctx, handleUserDeleteMember);
-        } else if (method === 'POST' && pathname === '/api/member_song_preferences') {
-             // Save member song preference (Using File 2 authMiddleware, File 1 logic and ON CONFLICT)
-             responseFromRoute = await authMiddleware(request, env, ctx, handleSaveMemberSongPreference);
-        } else if (method === 'GET' && pathname === '/api/member_song_preferences') {
-             // Fetch member song preferences (Using File 2 authMiddleware, File 1 logic and path)
-             // Note: File 1 uses query params ?member_id=...&stage=...
-             responseFromRoute = await authMiddleware(request, env, ctx, handleFetchMemberSongPreferences);
+        // --- Authenticated User Routes (Require authMiddleware) ---
+        // Use authMiddleware to protect these routes
+        if (path === '/api/members/me' && method === 'GET') {
+            return authMiddleware(request, env, ctx, handleFetchMe);
+        }
+        if (path === '/api/teams/join' && method === 'POST') {
+            return authMiddleware(request, env, ctx, handleJoinTeam);
+        }
+        if (path.startsWith('/api/members/') && path.split('/').length === 4 && method === 'PATCH') {
+             // Matches /api/members/:maimaiId (User update)
+             return authMiddleware(request, env, ctx, handleUserPatchMember);
+        }
+        if (path.startsWith('/api/members/') && path.split('/').length === 4 && method === 'DELETE') {
+             // Matches /api/members/:maimaiId (User delete)
+             return authMiddleware(request, env, ctx, handleUserDeleteMember);
+        }
+        if (path === '/api/member_song_preferences' && method === 'POST') {
+             // User saves song preference
+             return authMiddleware(request, env, ctx, handleSaveMemberSongPreference);
+        }
+         if (path === '/api/member_song_preferences' && method === 'GET') {
+             // User fetches song preferences (requires member_id and stage query params)
+             return authMiddleware(request, env, ctx, handleFetchMemberSongPreferences);
+        }
+        // NEW: User Match Selection View
+        if (path.startsWith('/api/member/match-selection/') && path.split('/').length === 5 && method === 'GET') {
+             // Matches /api/member/match-selection/:matchId
+             return authMiddleware(request, env, ctx, handleFetchUserMatchSelectionData);
+        }
+        // NEW: User Save Match Selection
+        if (path.startsWith('/api/member/match-selection/') && path.split('/').length === 5 && method === 'POST') {
+             // Matches /api/member/match-selection/:matchId
+             return authMiddleware(request, env, ctx, handleSaveMatchPlayerSelection);
+        }
+        // NEW: Match Selection Status (Accessible to authenticated users involved in the match or admins)
+        // Making it authenticated for now, as it reveals team/member selection status.
+        if (path.startsWith('/api/tournament_matches/') && path.endsWith('/selection-status') && path.split('/').length === 5 && method === 'GET') {
+             // Matches /api/tournament_matches/:matchId/selection-status
+             return authMiddleware(request, env, ctx, handleFetchMatchSelectionStatus);
         }
 
 
-        // --- Admin API Endpoints (Require Admin Auth) ---
-        // Use adminAuthMiddleware (From File 2) to protect these routes
-        else if (method === 'GET' && pathname === '/api/admin/members') {
-             // Admin fetch all members (Using File 2 adminAuthMiddleware, File 1 logic)
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, handleAdminFetchMembers);
-        } else if (method === 'GET' && pathname.match(/^\/api\/admin\/members\/\d+$/)) { // Match /api/admin/members/:id (From File 2)
-             // Admin get member by ID (Using File 2 adminAuthMiddleware, File 2 logic)
-             const memberId = parseInt(pathname.split('/')[4], 10);
-             if (isNaN(memberId)) {
-                 responseFromRoute = errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
-             } else {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminGetMemberById(req, env, ctx, userId, memberId));
-             }
-        } else if (method === 'PATCH' && pathname.match(/^\/api\/admin\/members\/\d+$/)) { // Match /api/admin/members/:id (From File 2)
-             // Admin patch member by ID (Using File 2 adminAuthMiddleware, File 2 logic)
-             const memberId = parseInt(pathname.split('/')[4], 10);
-             if (isNaN(memberId)) {
-                 responseFromRoute = errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
-             } else {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminPatchMember(req, env, ctx, userId, memberId));
-             }
+        // --- Admin Routes (Require adminAuthMiddleware) ---
+        // Use adminAuthMiddleware to protect these routes
+        if (path === '/api/admin/members' && method === 'GET') {
+            return adminAuthMiddleware(request, env, ctx, handleAdminFetchMembers);
         }
-        // Tournament/Match Admin Actions (Using File 2 adminAuthMiddleware, File 2 logic)
-        else if (method === 'POST' && pathname === '/api/tournament_matches') {
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, handleCreateTournamentMatch);
+        if (path.startsWith('/api/admin/members/') && path.split('/').length === 5 && method === 'GET') {
+             // Matches /api/admin/members/:id
+             return adminAuthMiddleware(request, env, ctx, handleAdminGetMemberById);
         }
-        else if (method === 'PUT' && pathname.match(/^\/api\/tournament_matches\/\d+\/confirm_setup$/)) { // Match /api/tournament_matches/:id/confirm_setup
-             const tournamentMatchId = parseInt(pathname.split('/')[3], 10);
-             if (isNaN(tournamentMatchId)) {
-                 responseFromRoute = errorResponse("Invalid tournament match ID in path", 400); // Uses File 2 errorResponse
-             } else {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleConfirmMatchSetup(req, env, ctx, userId, tournamentMatchId));
-             }
+        if (path.startsWith('/api/admin/members/') && path.split('/').length === 5 && method === 'PATCH') {
+             // Matches /api/admin/members/:id (Admin update)
+             return adminAuthMiddleware(request, env, ctx, handleAdminPatchMember);
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/tournament_matches\/\d+\/start_live$/)) { // Match /api/tournament_matches/:id/start_live
-             const tournamentMatchId = parseInt(pathname.split('/')[3], 10);
-             if (isNaN(tournamentMatchId)) {
-                 responseFromRoute = errorResponse("Invalid tournament match ID in path", 400); // Uses File 2 errorResponse
-             } else {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleStartLiveMatch(req, env, ctx, userId, tournamentMatchId));
-             }
+        if (path === '/api/admin/members' && method === 'POST') {
+             // Matches /api/admin/members (Admin add)
+             return adminAuthMiddleware(request, env, ctx, handleAdminAddMember);
         }
-        // Live Match DO Actions (Admin Only) (Using File 2 adminAuthMiddleware, File 2 logic)
-        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/calculate-round$/)) { // Match /api/live-match/:doId/calculate-round
-             const doIdString = pathname.split('/')[3];
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminCalculateRound(req, env, ctx, userId, doIdString));
+        if (path.startsWith('/api/admin/members/') && path.split('/').length === 5 && method === 'DELETE') {
+             // Matches /api/admin/members/:id (Admin delete)
+             return adminAuthMiddleware(request, env, ctx, handleAdminDeleteMember);
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/next-round$/)) { // Match /api/live-match/:doId/next-round
-             const doIdString = pathname.split('/')[3];
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminNextRound(req, env, ctx, userId, doIdString));
+        if (path === '/api/admin/settings' && method === 'PATCH') {
+             // Matches /api/admin/settings (Admin update settings)
+             return adminAuthMiddleware(request, env, ctx, handleAdminUpdateSettings);
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/archive$/)) { // Match /api/live-match/:doId/archive
-             const doIdString = pathname.split('/')[3];
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminArchiveMatch(req, env, ctx, userId, doIdString));
+        if (path === '/api/tournament_matches' && method === 'POST') {
+            return adminAuthMiddleware(request, env, ctx, handleCreateTournamentMatch);
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/resolve-draw$/)) { // Match /api/live-match/:doId/resolve-draw
-             const doIdString = pathname.split('/')[3];
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminResolveDraw(req, env, ctx, userId, doIdString));
+        if (path.startsWith('/api/tournament_matches/') && path.endsWith('/confirm_setup') && path.split('/').length === 5 && method === 'PUT') {
+             // Matches /api/tournament_matches/:id/confirm_setup
+             return adminAuthMiddleware(request, env, ctx, handleConfirmMatchSetup);
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/select-tiebreaker-song$/)) { // Match /api/live-match/:doId/select-tiebreaker-song
-             const doIdString = pathname.split('/')[3];
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminSelectTiebreakerSong(req, env, ctx, userId, doIdString));
+        // NEW: Admin Compile Match Setup
+        if (path.startsWith('/api/tournament_matches/') && path.endsWith('/compile-setup') && path.split('/').length === 5 && method === 'POST') {
+             // Matches /api/tournament_matches/:matchId/compile-setup
+             return adminAuthMiddleware(request, env, ctx, handleCompileMatchSetup);
+        }
+        // Admin Match DO routes (forwarded)
+        if (path.startsWith('/api/matches/') && path.endsWith('/calculate-round') && path.split('/').length === 5 && method === 'POST') {
+             // Matches /api/matches/:matchId/calculate-round
+             const matchId = path.split('/')[3];
+             return adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => forwardRequestToDO(matchId, env, req, '/calculate-round', 'POST'));
+        }
+        if (path.startsWith('/api/matches/') && path.endsWith('/resolve-draw') && path.split('/').length === 5 && method === 'POST') {
+             // Matches /api/matches/:matchId/resolve-draw
+             const matchId = path.split('/')[3];
+             return adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => forwardRequestToDO(matchId, env, req, '/resolve-draw', 'POST'));
+        }
+        if (path.startsWith('/api/matches/') && path.endsWith('/select-tiebreaker-song') && path.split('/').length === 5 && method === 'POST') {
+             // Matches /api/matches/:matchId/select-tiebreaker-song
+             const matchId = path.split('/')[3];
+             return adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => forwardRequestToDO(matchId, env, req, '/select-tiebreaker-song', 'POST'));
         }
 
 
-        // --- Fallback for unmatched routes (From File 1) ---
-        else {
-            responseFromRoute = errorResponse('Not Found', 404); // Uses File 2 errorResponse
-        }
-
-        // For WebSocket responses, the DO fetch already returns the response directly.
-        // For other responses, add CORS headers if they aren't already present (jsonResponse/errorResponse add them).
-        // This final check is mostly redundant if all handlers use jsonResponse/errorResponse,
-        // but can be a safeguard. However, the handlers *do* use those helpers,
-        // and the DO fetch for WebSocket returns a raw response that shouldn't have CORS headers added here.
-        // Let's rely on the handlers/DO fetch to set headers correctly.
-
-        return responseFromRoute;
+        // --- Not Found ---
+        return errorResponse('Not Found', 404);
     },
 };
 
+// Export the Durable Object class
 export { MatchDO };
+
+// --- Missing Payload Type Definitions (Based on usage in handlers) ---
+// These should ideally be in your types.ts file, but defined here for completeness
+// if they are not already there.
+
+// Payload for POST /api/tournament_matches
+interface CreateTournamentMatchPayload {
+    round_name: string;
+    team1_id: number;
+    team2_id: number;
+    scheduled_time?: string | null; // ISO string or null
+}
+
+// Payload for PUT /api/tournament_matches/:id/confirm_setup
+interface ConfirmMatchSetupPayload {
+    team1_player_order: number[]; // Array of member IDs
+    team2_player_order: number[]; // Array of member IDs
+    match_song_list: MatchSong[]; // Array of MatchSong objects
+}
+
+// Note: MatchSong type should be defined in your types.ts file
+// interface MatchSong {
+//     song_id: number;
+//     difficulty: string;
+//     player_id: number; // Member ID of the player who selected this song
+//     player_nickname: string;
+//     team_id: number;
+//     team_name: string;
+//     title: string; // Denormalized song title
+//     cover_filename?: string | null; // Denormalized cover filename
+//     parsedLevels?: SongLevel; // Denormalized parsed levels
+//     fullCoverUrl?: string; // Denormalized full cover URL
+// }

@@ -373,3 +373,68 @@ export interface SongFiltersApiResponseData {
     types: string[];
 }
 
+// Represents a player's song selections and order for a specific match (matches the DB table)
+export interface MatchPlayerSelection {
+    id?: number; // D1 PK
+    tournament_match_id: number; // FK to tournament_matches
+    member_id: number; // FK to members
+    team_id: number; // FK to teams
+    song1_id: number; // FK to songs
+    song1_difficulty: string; // e.g., 'M', 'E' (Difficulty key)
+    song2_id: number; // FK to songs
+    song2_difficulty: string; // e.g., 'M', 'E' (Difficulty key)
+    selected_order_index: number; // 0-based index (0 for 1st, 1 for 2nd, etc.)
+    created_at?: string;
+    updated_at?: string;
+}
+
+// Payload for saving a player's match selection (POST /api/member/match-selection/:matchId)
+export interface SaveMatchPlayerSelectionPayload {
+    song1_id: number;
+    song1_difficulty: string;
+    song2_id: number;
+    song2_difficulty: string;
+    selected_order_index: number;
+}
+
+// Response data for fetching user's match selection view data (GET /api/member/match-selection/:matchId)
+// This structure is what the backend sends to the frontend.
+export interface FetchUserMatchSelectionData { // Renamed to match frontend expectation
+    match: TournamentMatch; // Basic match info
+    myTeam: Team;
+    opponentTeam: Team;
+    myTeamMembers: Member[]; // Full member list for user's team
+    opponentTeamMembers: Member[]; // Full member list for opponent's team
+    mySelection: MatchPlayerSelection | null; // User's existing selection
+    // Occupied indices need member_id and nickname for frontend display
+    occupiedOrderIndices: { team_id: number; selected_order_index: number; member_id: number; member_nickname?: string }[];
+    availableOrderSlotsCount: number; // Total number of slots available per team (e.g., 3 for 3v3)
+    // Note: allSongs is NOT included here, frontend fetches it separately
+}
+
+// Response data for checking selection status (GET /api/tournament_matches/:matchId/selection-status)
+export interface MatchSelectionStatus { // Renamed to match frontend expectation
+    matchId: number;
+    isReadyToCompile: boolean; // True if all players have selected
+    team1Status: {
+        teamId: number;
+        teamName: string;
+        requiredSelections: number; // Number of players expected
+        completedSelections: number; // Number of players who have selected
+        missingMembers: { id: number; nickname: string }[]; // List of members missing selections
+    };
+    team2Status: {
+        teamId: number;
+        teamName: string;
+        requiredSelections: number;
+        completedSelections: number;
+        missingMembers: { id: number; nickname: string }[];
+    };
+}
+
+// Response data for compiling final match setup from player selections (POST /api/tournament_matches/:matchId/compile-setup)
+export interface CompileMatchSetupResponse { // Renamed to match frontend expectation
+    success: boolean;
+    message: string;
+    tournamentMatch?: TournamentMatch; // Optional: return the updated match
+}
