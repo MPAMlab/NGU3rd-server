@@ -1,8 +1,10 @@
 // src/index.ts
 
 // --- Imports ---
-import { createRemoteJWKSet, jwtVerify } from 'jose'; // Import jose functions
-// Import your updated types
+// Import @tsndr/cloudflare-worker-jwt for Kinde Auth (From File 2)
+import jwt from '@tsndr/cloudflare-worker-jwt';
+
+// Import your backend types (Ensure this file exists and contains necessary types)
 import type {
     Env,
     Team,
@@ -13,7 +15,7 @@ import type {
     ResolveDrawPayload,
     MatchScheduleData,
     MemberSongPreference,
-    SaveMemberSongPreferencePayload, // Added
+    SaveMemberSongPreferencePayload,
     Song,
     MatchSong,
     SelectTiebreakerSongPayload,
@@ -23,9 +25,16 @@ import type {
     SongsApiResponseData,
     SongFiltersApiResponseData,
     PaginationInfo,
-    KindeUser // Added
+    KindeUser,
+    MatchHistoryMatch, // Added from File 1 history handler
+    MatchHistoryRound // Added from File 1 history handler
 } from './types'; // Adjust path to your types file
+
 import { MatchDO } from './durable-objects/matchDo'; // Adjust path to your DO file
+
+// Import standard Worker types for clarity (From File 2)
+import { D1Database, R2Bucket, ExecutionContext, DurableObjectStub, DurableObjectId } from "@cloudflare/workers-types";
+
 
 // --- Configuration & Constants ---
 const CORS_HEADERS = {
@@ -36,20 +45,20 @@ const CORS_HEADERS = {
     'Access-Control-Allow-Credentials': 'true', // IMPORTANT for cookies
 };
 
-// Define JWKS outside the fetch handler to reuse the connection and cache keys
-let kindeJwks: ReturnType<typeof createRemoteJWKSet> | undefined;
+// Add this variable outside the fetch handler to cache the JWKS (From File 2)
+let cachedJwks: any = undefined; // Cache the fetched JWKS
 
-// --- Helper Functions (Keep existing helpers like getMatchDO, forwardRequestToDO, jsonResponse, errorResponse, etc.) ---
 
-// Helper to get a DO instance by Name string (using idFromName)
+// --- Helper Functions ---
+
+// Helper to get a DO instance by Name string (using idFromName) (From File 1/2 - same)
 const getMatchDO = (doName: string, env: Env): DurableObjectStub => {
     const id: DurableObjectId = env.MATCH_DO.idFromName(doName);
     return env.MATCH_DO.get(id);
 };
 
-// Helper to handle forwarding requests to DOs
-// Modified to read body inside if needed, to avoid middleware consuming it
-const forwardRequestToDO = async (doIdString: string, env: Env, request: Request, internalPath: string, method: string = 'POST'): Promise<Response> => {
+// Helper to handle forwarding requests to DOs (Using File 2's improved version)
+const forwardRequestToDO = async (doIdString: string, env: Env, request: Request, internalPath: string, method: string = 'POST', bodyData?: any): Promise<Response> => {
     try {
         const doStub = getMatchDO(doIdString, env);
         const doUrl = new URL(`https://dummy-host`); // Dummy host is fine for DO fetch
@@ -57,45 +66,54 @@ const forwardRequestToDO = async (doIdString: string, env: Env, request: Request
 
         const newHeaders = new Headers();
         for (const [key, value] of request.headers.entries()) {
-            if (key.toLowerCase() !== 'host') {
+            // Exclude headers that might cause issues or are specific to the Worker context
+            if (!['host', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
                 newHeaders.append(key, value);
             }
         }
 
         let requestBody: BodyInit | null | undefined = undefined;
-        // Only attempt to read body for methods that typically have one
-        if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-             try {
-                 // Clone the request before reading the body, in case the original is needed elsewhere
-                 const clonedRequest = request.clone();
-                 // Read the body as text first to handle potential non-JSON bodies or errors
-                 const bodyText = await clonedRequest.text();
-                 if (bodyText) {
-                     // Attempt to parse as JSON, but send as text if parsing fails or it's not JSON
-                     try {
-                         const bodyJson = JSON.parse(bodyText);
-                         requestBody = JSON.stringify(bodyJson); // Send as JSON string
-                         newHeaders.set('Content-Type', 'application/json'); // Ensure correct content type
-                     } catch (e) {
-                         // If JSON parsing fails, send the body as text
-                         requestBody = bodyText;
-                         // Attempt to preserve original Content-Type if it wasn't JSON
-                         if (!newHeaders.has('Content-Type') || newHeaders.get('Content-Type')?.toLowerCase() === 'application/json') {
-                             newHeaders.set('Content-Type', 'text/plain'); // Default to text if original was JSON or missing
+
+        // If bodyData is explicitly provided (e.g., for DO initialization with parsed data)
+        if (bodyData !== undefined) {
+             requestBody = JSON.stringify(bodyData);
+             newHeaders.set('Content-Type', 'application/json');
+        } else {
+            // Otherwise, attempt to read the body from the original request
+            // Only attempt to read body for methods that typically have one
+            if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+                 try {
+                     // Clone the request before reading the body, in case the original is needed elsewhere
+                     const clonedRequest = request.clone();
+                     // Read the body as text first to handle potential non-JSON bodies or errors
+                     const bodyText = await clonedRequest.text();
+                     if (bodyText) {
+                         // Attempt to parse as JSON, but send as text if parsing fails or it's not JSON
+                         try {
+                             const bodyJson = JSON.parse(bodyText);
+                             requestBody = JSON.stringify(bodyJson); // Send as JSON string
+                             newHeaders.set('Content-Type', 'application/json'); // Ensure correct content type
+                         } catch (e) {
+                             // If JSON parsing fails, send the body as text
+                             requestBody = bodyText;
+                             // Attempt to preserve original Content-Type if it wasn't JSON
+                             if (!newHeaders.has('Content-Type') || newHeaders.get('Content-Type')?.toLowerCase() === 'application/json') {
+                                 newHeaders.set('Content-Type', 'text/plain'); // Default to text if original was JSON or missing
+                             }
+                             console.warn(`Worker: Failed to parse request body as JSON for DO forwarding to ${internalPath}. Sending as text.`, e);
                          }
-                         console.warn(`Worker: Failed to parse request body as JSON for DO forwarding to ${internalPath}. Sending as text.`, e);
                      }
+                 } catch (e) {
+                     console.error(`Worker: Failed to read request body for DO forwarding to ${internalPath}:`, e);
+                     // Continue without body if reading fails
                  }
-             } catch (e) {
-                 console.error(`Worker: Failed to read request body for DO forwarding to ${internalPath}:`, e);
-                 // Continue without body if reading fails
-             }
+            }
         }
 
 
         const requestInit: RequestInit = {
             method: method,
-            headers: newHeaders,
+            headers: newHeaders, // Use the mutable Headers object
             body: requestBody,
             redirect: 'follow',
             cf: request.cf,
@@ -116,12 +134,12 @@ const forwardRequestToDO = async (doIdString: string, env: Env, request: Request
         if (e.stack) {
             console.error(`Worker: Error stack: ${e.stack}`);
         }
-        return new Response(JSON.stringify({ success: false, error: `Failed to communicate with match instance: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ success: false, error: `Failed to communicate with match instance: ${e.message}` }), { status: 500, headers: { 'Content-Type': 'application/json', ...CORS_HEADERS } }); // Ensure CORS headers on 500
     }
 };
 
 
-// Helper to wrap responses in ApiResponse format (Keep as is)
+// Helper to wrap responses in ApiResponse format (From File 1/2 - same)
 function jsonResponse<T>(data: T, status: number = 200): Response {
     return new Response(JSON.stringify({ success: true, data }), {
         status,
@@ -129,16 +147,17 @@ function jsonResponse<T>(data: T, status: number = 200): Response {
     });
 }
 
-function errorResponse(error: string, status: number = 500): Response {
-    console.error(`API Error (${status}): ${error}`); // Log errors on the backend
-    return new Response(JSON.stringify({ success: false, error }), {
+// Helper to wrap error responses (Using File 2's version with details)
+function errorResponse(error: string, status: number = 500, details?: any): Response {
+    console.error(`API Error (${status}): ${error}`, details); // Log errors on the backend
+    return new Response(JSON.stringify({ success: false, error, details }), { // Include details in response body
         status,
         headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
     });
 }
 
 
-// Placeholder for R2 Avatar Upload (Ensure this uses env.AVATAR_BUCKET and env.R2_PUBLIC_BUCKET_URL)
+// Placeholder for R2 Avatar Upload (Using File 2's version with logging)
 async function uploadAvatar(env: Env, file: File, identifier: string, teamCode: string): Promise<string | null> {
     console.log(`Uploading avatar for ${identifier} in team ${teamCode}`);
     try {
@@ -160,7 +179,7 @@ async function uploadAvatar(env: Env, file: File, identifier: string, teamCode: 
     }
 }
 
-// Placeholder for R2 Avatar Deletion (Ensure this uses env.AVATAR_BUCKET and env.R2_PUBLIC_BUCKET_URL)
+// Placeholder for R2 Avatar Deletion (Using File 2's version with logging)
 async function deleteAvatarFromR2(env: Env, url: string): Promise<void> {
     console.log(`Deleting avatar from R2: ${url}`);
     try {
@@ -183,9 +202,8 @@ async function deleteAvatarFromR2(env: Env, url: string): Promise<void> {
     }
 }
 
-// Placeholder for checking and deleting empty teams (Keep as is)
+// Placeholder for checking and deleting empty teams (From File 1/2 - same)
 async function checkAndDeleteEmptyTeam(env: Env, teamCode: string): Promise<void> {
-    // ... (Your existing checkAndDeleteEmptyTeam logic) ...
     console.log(`Checking if team ${teamCode} is empty for deletion.`);
     try {
         const countResult = await env.DB.prepare('SELECT COUNT(*) as count FROM members WHERE team_code = ?').bind(teamCode).first<{ count: number }>();
@@ -207,8 +225,7 @@ async function checkAndDeleteEmptyTeam(env: Env, teamCode: string): Promise<void
     }
 }
 
-// Helper functions for CSV export (reused from frontend or defined here) (Keep as is)
-// ... (Your existing getColorText, getJobText, formatTimestamp) ...
+// Helper functions for CSV export (From File 1/2 - same)
 function getColorText(colorId: string | null | undefined): string {
      const map: { [key: string]: string } = { red: '火', green: '木', blue: '水' };
      return map[colorId || ''] || '未知';
@@ -237,140 +254,268 @@ function formatTimestamp(timestamp: number | null | undefined): string {
 }
 
 
-// --- Kinde Authentication Helpers ---
+// --- Kinde Authentication Helpers (Using File 2's logic) ---
 
-// Helper to verify Kinde Access Token using jose (Keep as is, looks correct)
+// Helper to verify Kinde Access Token using @tsndr/cloudflare-worker-jwt (From File 2)
 async function verifyKindeToken(env: Env, token: string): Promise<{ userId: string, claims: any } | null> {
     if (!env.KINDE_ISSUER_URL) {
         console.error("KINDE_ISSUER_URL not configured in Worker secrets.");
         return null;
     }
-
-    if (!kindeJwks) {
-        try {
-             kindeJwks = createRemoteJWKSet(new URL(`${env.KINDE_ISSUER_URL}/.well-known/jwks`));
-             console.log("Kinde JWKS set created.");
-        } catch (e) {
-             console.error("Failed to create Kinde JWKS set:", e);
-             return null;
-        }
+    // Ensure KINDE_CLIENT_ID is configured for audience validation
+    if (!env.KINDE_CLIENT_ID) {
+         console.error("KINDE_CLIENT_ID not configured in Worker secrets.");
+         return null;
     }
 
-    try {
-        const { payload } = await jwtVerify(token, kindeJwks, {
-            issuer: env.KINDE_ISSUER_URL,
-            // audience: env.KINDE_AUDIENCE, // If you have an audience
-        });
+    // For a single-application worker, the audience is just the client ID
+    const expectedAudience = env.KINDE_CLIENT_ID;
+    console.log("Expected Kinde Audience for verification:", expectedAudience);
 
+    try {
+        // 1. Decode the token to get the header and payload (without verification)
+        console.log("Attempting to decode token...");
+        const decoded = jwt.decode(token);
+        const payload = decoded.payload;
+        const header = decoded.header;
+        console.log("Token header:", header);
+        console.log("Token payload:", payload);
+
+        // 2. Perform basic claim validation (issuer, expiration)
+        const now = Math.floor(Date.now() / 1000);
+        if (payload.exp && payload.exp < now) {
+            console.warn("Token expired.");
+            return null; // Token expired
+        }
+        if (payload.iss !== env.KINDE_ISSUER_URL) {
+            console.warn(`Invalid issuer: ${payload.iss}, expected: ${env.KINDE_ISSUER_URL}`);
+            return null; // Invalid issuer
+        }
+        // Kinde's user ID is typically in the 'sub' claim
         if (!payload.sub) {
-             console.error("Kinde token payload missing 'sub' claim.");
+             console.warn("Token payload missing 'sub' claim.");
+             return null; // Missing subject
+        }
+
+        // 检查azp字段 - 对于多域名Kinde认证的特殊处理 (From File 2)
+        if ((!payload.aud || (Array.isArray(payload.aud) && payload.aud.length === 0)) &&
+            payload.azp === expectedAudience) {
+            console.log("Empty audience with matching azp detected - skipping signature verification and trusting token");
+            // 对于空audience但azp匹配的情况，我们信任这个token
+            // 这是一个绕过方案，用于处理多域名Kinde认证
+            return { userId: payload.sub as string, claims: payload };
+        }
+
+        // 3. Fetch or use cached JWKS (From File 2)
+        if (!cachedJwks) {
+            const jwksUrl = `${env.KINDE_ISSUER_URL}/.well-known/jwks`;
+            console.log(`Fetching JWKS from: ${jwksUrl}`);
+            const jwksResponse = await fetch(jwksUrl);
+            if (!jwksResponse.ok) {
+                console.error(`Failed to fetch JWKS: ${jwksResponse.status} ${jwksResponse.statusText}`);
+                return null; // Failed to fetch keys
+            }
+            cachedJwks = await jwksResponse.json();
+            console.log("Fetched and cached JWKS."); // Log caching
+        } else {
+            console.log("Using cached JWKS."); // Log cache hit
+        }
+
+        // Ensure cachedJwks is valid before proceeding (From File 2)
+        if (!cachedJwks || !Array.isArray(cachedJwks.keys)) {
+             console.error("Cached JWKS is invalid.");
+             cachedJwks = undefined; // Clear invalid cache
              return null;
         }
 
-        return { userId: payload.sub, claims: payload };
+        // 4. Find the correct key from the JWKS based on the token's kid (From File 2)
+        const kid = header.kid;
+        const key = cachedJwks.keys.find((k: any) => k.kid === kid);
+        if (!key) {
+            console.error(`No key found in JWKS with kid: ${kid}`);
+            cachedJwks = undefined; // Clear cache in case of key rotation
+            return null; // Key not found
+        }
+        console.log("Found matching JWK:", key);
 
-    } catch (e) {
-        console.error("Error verifying Kinde token with jose:", e);
+        // 5. Import the JWK as a CryptoKey using Web Crypto API (From File 2)
+        console.log("Attempting to import JWK as CryptoKey...");
+        let publicKey: CryptoKey;
+        try {
+            publicKey = await crypto.subtle.importKey(
+                'jwk', // Format is JWK
+                key,   // The JWK object
+                {      // Algorithm parameters for RS256
+                    name: 'RSASSA-PKCS1-v1_5', // Standard name for RS256 in Web Crypto API
+                    hash: 'SHA-256',           // Hash algorithm is SHA-256
+                },
+                false, // Not extractable (public key doesn't need to be)
+                ['verify'] // Key usage is for verification
+            );
+            console.log("JWK imported successfully as CryptoKey.");
+        } catch (importError: any) {
+            console.error("Failed to import JWK as CryptoKey:", importError);
+            if (importError.message) console.error(`Import error message: ${importError.message}`);
+            if (importError.stack) console.error(`Import error stack: ${importError.stack}`);
+            return null; // Failed to import key
+        }
+
+        // 6. Verify the token signature and claims using the imported CryptoKey (From File 2)
+        console.log("Attempting to verify token signature and claims with @tsndr/cloudflare-worker-jwt using CryptoKey...");
+
+        // 验证选项 - 如果是空audience，就不检查audience (From File 2)
+        const verifyOptions: any = { algorithms: ['RS256'] };
+
+        // 只在audience不为空的情况下验证audience (From File 2)
+        if (payload.aud && Array.isArray(payload.aud) && payload.aud.length > 0) {
+            verifyOptions.audience = expectedAudience;
+        } else {
+            console.log("Empty audience detected, skipping audience validation");
+        }
+
+        const verified = await jwt.verify(token, publicKey, verifyOptions);
+
+        if (!verified) {
+            console.warn("Token signature verification failed.");
+            console.warn("Token audience was:", payload.aud);
+            console.warn("Token azp was:", payload.azp);
+            return null;
+        }
+
+        console.log("Token verification successful.");
+        return { userId: payload.sub as string, claims: payload };
+
+    } catch (e: any) {
+        console.error("Error verifying Kinde token:", e);
+        if (e.message) console.error(`Error message: ${e.message}`);
+        if (e.stack) console.error(`Error stack: ${e.stack}`);
         return null;
     }
 }
 
-// Middleware-like function to extract Kinde User ID from token/cookie (Keep as is, looks correct)
+
+// Middleware-like function to extract Kinde User ID from token/cookie (Using File 2's improved version)
 async function getAuthenticatedKindeUser(request: Request, env: Env): Promise<string | null> {
     const authHeader = request.headers.get('Authorization');
     let token = null;
+
+    // 1. Check Authorization header first (Bearer token)
     if (authHeader?.startsWith('Bearer ')) {
         token = authHeader.substring(7);
-    } else {
+        console.log("Found token in Authorization header.");
+    }
+    // 2. If no Bearer token, check for 'kinde_access_token' cookie
+    else {
         const cookieHeader = request.headers.get('Cookie');
         if (cookieHeader) {
-            const cookies = cookieHeader.split(';').map(c => c.trim().split('='));
-            const accessTokenCookie = cookies.find(cookie => cookie[0] === 'kinde_access_token');
-            if (accessTokenCookie) {
-                token = accessTokenCookie[1];
+            // More robust cookie parsing (From File 2)
+            const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+                const [key, value] = cookie.trim().split('=');
+                acc[key] = value;
+                return acc;
+            }, {} as Record<string, string>);
+
+            if (cookies['kinde_access_token']) {
+                token = cookies['kinde_access_token'];
+                console.log("Found token in 'kinde_access_token' cookie.");
+            } else {
+                 console.log("No 'kinde_access_token' cookie found.");
             }
+        } else {
+             console.log("No Cookie header found.");
         }
     }
 
     if (!token) {
+        console.log("No Kinde token found in Authorization header or cookies.");
         return null; // No token found
     }
 
-    const verificationResult = await verifyKindeToken(env, token);
+    const verificationResult = await verifyKindeToken(env, token); // Uses the File 2 verify function
     if (!verificationResult) {
         console.warn("Kinde token verification failed.");
         return null; // Token invalid or expired
     }
 
+    console.log(`Authenticated Kinde User ID: ${verificationResult.userId}`);
     return verificationResult.userId; // Return the Kinde user ID
 }
 
-// Helper to check if the authenticated Kinde user is marked as admin in the DB (Keep as is, looks correct)
+// Helper to check if the authenticated Kinde user is marked as admin in the DB (From File 1/2 - same core logic)
 async function isAdminUser(env: Env, kindeUserId: string): Promise<boolean> {
     if (!kindeUserId) return false;
     try {
         const member = await env.DB.prepare('SELECT is_admin FROM members WHERE kinde_user_id = ? LIMIT 1')
             .bind(kindeUserId)
             .first<{ is_admin: number | null }>();
-        return member?.is_admin === 1;
-    } catch (e) {
+        const isAdmin = member?.is_admin === 1;
+        console.log(`Checking admin status for Kinde ID ${kindeUserId}: ${isAdmin ? 'Is Admin' : 'Not Admin'}`); // Added logging from File 2
+        return isAdmin;
+    } catch (e: any) {
         console.error(`Database error checking admin status for Kinde ID ${kindeUserId}:`, e);
         return false; // Assume not admin on error
     }
 }
 
-// --- Collection Status Helper ---
+
+// --- Collection Status Helper (From File 1/2 - same core logic) ---
 async function isCollectionPaused(env: Env): Promise<boolean> {
     try {
         const setting = await env.DB.prepare('SELECT value FROM settings WHERE key = ? LIMIT 1')
             .bind('collection_paused')
             .first<{ value: string }>();
-        return setting?.value === 'true';
-    } catch (e) {
+        const isPaused = setting?.value === 'true';
+        console.log(`Collection paused status: ${isPaused}`); // Added logging from File 2
+        return isPaused;
+    } catch (e: any) {
         console.error('Database error fetching collection_paused setting:', e);
         return false;
     }
 }
 
 
-// --- Authentication Middleware ---
+// --- Authentication Middleware (Using File 2's version with logging) ---
 // This middleware checks if the user is authenticated via Kinde token/cookie.
 // If authenticated, it calls the next handler with the kindeUserId.
 // If not authenticated, it returns a 401 Unauthorized response.
 type AuthenticatedHandler = (request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string) => Promise<Response>;
 
 async function authMiddleware(request: Request, env: Env, ctx: ExecutionContext, handler: AuthenticatedHandler): Promise<Response> {
-    const kindeUserId = await getAuthenticatedKindeUser(request, env);
+    console.log(`Running authMiddleware for ${new URL(request.url).pathname}`); // Added logging from File 2
+    const kindeUserId = await getAuthenticatedKindeUser(request, env); // Uses the File 2 getAuthenticatedKindeUser
 
     if (!kindeUserId) {
         console.warn(`Authentication required for ${new URL(request.url).pathname}`);
-        return apiError('Authentication required.', 401);
+        return errorResponse('Authentication required.', 401); // Uses File 2 errorResponse
     }
 
+    console.log(`User authenticated with Kinde ID: ${kindeUserId}. Proceeding to handler.`); // Added logging from File 2
     // User is authenticated, proceed to the actual handler with the user ID
     return handler(request, env, ctx, kindeUserId);
 }
 
-// --- Admin Authentication Middleware ---
+// --- Admin Authentication Middleware (Using File 2's version with logging) ---
 // This middleware checks if the user is authenticated AND is an admin.
 type AdminAuthenticatedHandler = (request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string) => Promise<Response>;
 
 async function adminAuthMiddleware(request: Request, env: Env, ctx: ExecutionContext, handler: AdminAuthenticatedHandler): Promise<Response> {
+    console.log(`Running adminAuthMiddleware for ${new URL(request.url).pathname}`); // Added logging from File 2
     // First, check if the user is authenticated at all
-    const kindeUserId = await getAuthenticatedKindeUser(request, env);
+    const kindeUserId = await getAuthenticatedKindeUser(request, env); // Uses the File 2 getAuthenticatedKindeUser
 
     if (!kindeUserId) {
         console.warn(`Admin access denied: User not authenticated via Kinde for ${new URL(request.url).pathname}`);
-        return apiError('Authentication required.', 401);
+        return errorResponse('Authentication required.', 401); // Uses File 2 errorResponse
     }
 
     // If authenticated, check if they are an admin
-    const isAdmin = await isAdminUser(env, kindeUserId);
+    const isAdmin = await isAdminUser(env, kindeUserId); // Uses the File 2 isAdminUser
     if (!isAdmin) {
         console.warn(`Admin access denied: User ${kindeUserId} is not an admin for ${new URL(request.url).pathname}`);
-        return apiError('Authorization failed: You do not have administrator privileges.', 403);
+        return errorResponse('Authorization failed: You do not have administrator privileges.', 403); // Uses File 2 errorResponse
     }
 
+    console.log(`Admin user ${kindeUserId} authenticated. Proceeding to admin handler.`); // Added logging from File 2
     // If authenticated and is admin, proceed to the actual admin handler
     return handler(request, env, ctx, kindeUserId);
 }
@@ -378,38 +523,39 @@ async function adminAuthMiddleware(request: Request, env: Env, ctx: ExecutionCon
 
 // --- Route Handlers ---
 
-// GET /api/settings (Public) (Keep as is)
+// GET /api/settings (Public) (From File 1/2 - same)
 async function handleGetSettings(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/settings request...');
     try {
         const paused = await isCollectionPaused(env);
         return jsonResponse({ collection_paused: paused }, 200);
-    } catch (e) {
+    } catch (e: any) { // Added type any for catch error
         console.error('Error fetching settings:', e);
-        return errorResponse('Failed to fetch settings.', 500, e);
+        return errorResponse('Failed to fetch settings.', 500, e); // Uses File 2 errorResponse
     }
 }
 
-// POST /api/kinde/callback (Public) - NEW
+// POST /api/kinde/callback (Public) - NEW (From File 2)
 async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     console.log('Handling /api/kinde/callback request...');
     const url = new URL(request.url);
     const body = await request.json().catch(() => null);
-    if (!body) return errorResponse('Invalid or missing JSON body.', 400);
+    if (!body) return errorResponse('Invalid or missing JSON body.', 400); // Uses File 2 errorResponse
 
     const { code, code_verifier, redirect_uri } = body;
 
     if (!code || !code_verifier || !redirect_uri) {
-        return errorResponse('Missing code, code_verifier, or redirect_uri in callback request.', 400);
+        return errorResponse('Missing code, code_verifier, or redirect_uri in callback request.', 400); // Uses File 2 errorResponse
     }
 
     if (!env.KINDE_CLIENT_ID || !env.KINDE_CLIENT_SECRET || !env.KINDE_ISSUER_URL || !env.KINDE_REDIRECT_URI || !env.LOGOUT_REDIRECT_TARGET_URL) {
          console.error("Kinde secrets not configured in Worker.");
-         return errorResponse('Server configuration error.', 500);
+         return errorResponse('Server configuration error.', 500); // Uses File 2 errorResponse
     }
 
     try {
         const tokenUrl = `${env.KINDE_ISSUER_URL}/oauth2/token`;
+        console.log(`Exchanging code for token at: ${tokenUrl}`); // Added logging from File 2
         const tokenResponse = await fetch(tokenUrl, {
             method: 'POST',
             headers: {
@@ -426,36 +572,45 @@ async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionCon
         });
 
         const tokenData = await tokenResponse.json();
+        console.log("Kinde token exchange response status:", tokenResponse.status); // Added logging from File 2
+        console.log("Kinde token exchange response body:", tokenData); // Added logging from File 2
+
 
         if (!tokenResponse.ok) {
             console.error('Kinde token exchange failed:', tokenResponse.status, tokenData);
-            return errorResponse(tokenData.error_description || tokenData.error || 'Failed to exchange authorization code for tokens.', tokenResponse.status);
+            return errorResponse(tokenData.error_description || tokenData.error || 'Failed to exchange authorization code for tokens.', tokenResponse.status); // Uses File 2 errorResponse
         }
 
         const { access_token, id_token, refresh_token, expires_in } = tokenData;
 
         const headers = new Headers(CORS_HEADERS);
         const secure = url.protocol === 'https:' ? '; Secure' : '';
-        const domain = url.hostname; // Use the domain from the request URL for the cookie domain
-
-        // Set Access Token cookie (HttpOnly)
-        headers.append('Set-Cookie', `kinde_access_token=${access_token}; HttpOnly; Path=/; Max-Age=${expires_in}; SameSite=Lax${secure}; Domain=${domain}`);
+        // Removed Domain attribute from cookie setting (From File 2)
+        headers.append('Set-Cookie', `kinde_access_token=${access_token}; HttpOnly; Path=/; Max-Age=${expires_in}; SameSite=Lax${secure}`);
+        console.log("Set kinde_access_token cookie."); // Added logging from File 2
 
         // Set Refresh Token cookie (HttpOnly)
         if (refresh_token) {
              const refreshTokenMaxAge = 30 * 24 * 60 * 60; // 30 days
-             headers.append('Set-Cookie', `kinde_refresh_token=${refresh_token}; HttpOnly; Path=/; Max-Age=${refreshTokenMaxAge}; SameSite=Lax${secure}; Domain=${domain}`);
+             // Removed Domain attribute from cookie setting (From File 2)
+             headers.append('Set-Cookie', `kinde_refresh_token=${refresh_token}; HttpOnly; Path=/; Max-Age=${refreshTokenMaxAge}; SameSite=Lax${secure}`);
+             console.log("Set kinde_refresh_token cookie."); // Added logging from File 2
         }
 
-        // Decode ID token for basic user info to return to frontend
+        // Decode ID token for basic user info to return to frontend (Using File 2's jwt.decode)
         let userInfo: KindeUser | {} = {};
         try {
-            const idTokenPayload = JSON.parse(atob(id_token.split('.')[1]));
+            console.log("Decoding ID token payload..."); // Added logging from File 2
+            const idTokenDecoded = jwt.decode(id_token); // Uses File 2's jwt.decode
+            const idTokenPayload = idTokenDecoded.payload;
+
+            console.log("ID Token Payload:", idTokenPayload); // Added logging from File 2
             userInfo = {
                 id: idTokenPayload.sub, // Kinde User ID
                 email: idTokenPayload.email,
                 name: idTokenPayload.given_name && idTokenPayload.family_name ? `${idTokenPayload.given_name} ${idTokenPayload.family_name}` : idTokenPayload.given_name || idTokenPayload.family_name || idTokenPayload.email,
             } as KindeUser;
+            console.log("Decoded User Info:", userInfo); // Added logging from File 2
         } catch (e) {
             console.error("Failed to decode ID token payload:", e);
         }
@@ -465,24 +620,25 @@ async function handleKindeCallback(request: Request, env: Env, ctx: ExecutionCon
             headers: headers,
         });
 
-    } catch (kindeError) {
+    } catch (kindeError: any) { // Added type any for catch error
         console.error('Error during Kinde token exchange:', kindeError);
-        return errorResponse('Failed to communicate with authentication server.', 500, kindeError);
+        return errorResponse('Failed to communicate with authentication server.', 500, kindeError); // Uses File 2 errorResponse
     }
 }
 
-// NEW: GET /api/logout (Public) - Handles clearing HttpOnly cookies and redirect
+// NEW: GET /api/logout (Public) - Handles clearing HttpOnly cookies and redirect (From File 2)
 async function handleLogout(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/logout request...');
     const url = new URL(request.url);
     const headers = new Headers(CORS_HEADERS);
     const secure = url.protocol === 'https:' ? '; Secure' : '';
-    const domain = url.hostname;
+    // Removed Domain attribute from cookie setting (From File 2)
+    headers.append('Set-Cookie', `kinde_access_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`);
+    console.log("Cleared kinde_access_token cookie."); // Added logging from File 2
+    // Removed Domain attribute from cookie setting (From File 2)
+    headers.append('Set-Cookie', `kinde_refresh_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}`);
+    console.log("Cleared kinde_refresh_token cookie."); // Added logging from File 2
 
-    // Clear Access Token cookie
-    headers.append('Set-Cookie', `kinde_access_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}; Domain=${domain}`);
-    // Clear Refresh Token cookie
-    headers.append('Set-Cookie', `kinde_refresh_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax${secure}; Domain=${domain}`);
 
     // Redirect to Kinde's logout endpoint
     if (!env.KINDE_ISSUER_URL || !env.LOGOUT_REDIRECT_TARGET_URL) {
@@ -493,13 +649,14 @@ async function handleLogout(request: Request, env: Env): Promise<Response> {
 
     const kindeLogoutUrl = new URL(`${env.KINDE_ISSUER_URL}/logout`);
     kindeLogoutUrl.searchParams.append('redirect', env.LOGOUT_REDIRECT_TARGET_URL);
+    console.log(`Redirecting to Kinde logout URL: ${kindeLogoutUrl.toString()}`); // Added logging from File 2
 
     // Return a redirect response
     return Response.redirect(kindeLogoutUrl.toString(), 302);
 }
 
 
-// GET /api/teams (Public) (Keep as is)
+// GET /api/teams (Public) (From File 1/2 - same)
 async function handleFetchTeams(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams request...');
     try {
@@ -507,76 +664,76 @@ async function handleFetchTeams(request: Request, env: Env): Promise<Response> {
         return jsonResponse(results);
     } catch (e: any) {
         console.error("Worker: Failed to list teams:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// GET /api/teams/:code (Public) (Keep as is)
+// GET /api/teams/:code (Public) (From File 1/2 - same)
 async function handleGetTeamByCode(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/:code request...');
     const parts = new URL(request.url).pathname.split('/');
     if (parts.length !== 4 || !parts[3]) {
-        return errorResponse('Invalid API path. Use /api/teams/:code', 400);
+        return errorResponse('Invalid API path. Use /api/teams/:code', 400); // Uses File 2 errorResponse
     }
     const teamCode = parts[3];
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400);
+        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
     }
 
     try {
         const teamResult = await env.DB.prepare('SELECT name FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first<{ name: string }>();
 
         if (!teamResult) {
-            return errorResponse(`Team with code ${teamCode} not found.`, 404);
+            return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
         }
 
         const membersResult = await env.DB.prepare(
             'SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE team_code = ? ORDER BY joined_at ASC'
-        ).bind(teamCode).all<Member>(); // Use Member type
+        ).bind(teamCode).all<Member>();
 
         return jsonResponse({
             success: true, // Add success: true for consistency with ApiResponse
             code: teamCode,
             name: teamResult.name,
-            members: membersResult.results || []
+            members: membersResult.results || [] // Use results from the D1 query
         }, 200);
 
     } catch (e: any) {
         console.error('Database error fetching team by code:', e);
-        return errorResponse('Failed to fetch team information.', 500, e);
+        return errorResponse('Failed to fetch team information.', 500, e); // Uses File 2 errorResponse
     }
 }
 
-// POST /api/teams/check (Public) (Keep as is)
+// POST /api/teams/check (Public) (From File 1/2 - same)
 async function handleCheckTeam(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/check request...');
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying team check.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
     }
 
     const body = await request.json().catch(() => null);
     if (!body || typeof body.teamCode !== 'string') {
-        return errorResponse('Invalid or missing teamCode in request body.', 400);
+        return errorResponse('Invalid or missing teamCode in request body.', 400); // Uses File 2 errorResponse
     }
     const teamCode = body.teamCode.trim();
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400);
+        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
     }
 
     try {
         const teamResult = await env.DB.prepare('SELECT name FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first<{ name: string }>();
 
         if (!teamResult) {
-            return errorResponse(`Team with code ${teamCode} not found.`, 404);
+            return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
         }
 
         const membersResult = await env.DB.prepare(
             'SELECT color, job, maimai_id, nickname, avatar_url FROM members WHERE team_code = ?'
-        ).bind(teamCode).all<Partial<Member>>(); // Use Partial<Member> as not all fields are selected
+        ).bind(teamCode).all<Partial<Member>>();
 
         return jsonResponse({
             success: true,
@@ -587,37 +744,37 @@ async function handleCheckTeam(request: Request, env: Env): Promise<Response> {
 
     } catch (e: any) {
         console.error('Database error checking team:', e);
-        return errorResponse('Failed to check team information.', 500, e);
+        return errorResponse('Failed to check team information.', 500, e); // Uses File 2 errorResponse
     }
 }
 
-// POST /api/teams/create (Public) (Keep as is)
+// POST /api/teams/create (Public) (From File 1/2 - same)
 async function handleCreateTeam(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/teams/create request...');
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying team creation.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
     }
 
     const body = await request.json().catch(() => null);
     if (!body || typeof body.teamCode !== 'string' || typeof body.teamName !== 'string') {
-        return errorResponse('Invalid or missing teamCode or teamName in request body.', 400);
+        return errorResponse('Invalid or missing teamCode or teamName in request body.', 400); // Uses File 2 errorResponse
     }
     const teamCode = body.teamCode.trim();
     const teamName = body.teamName.trim();
 
     if (teamCode.length !== 4 || isNaN(parseInt(teamCode))) {
-        return errorResponse('Invalid team code format.', 400);
+        return errorResponse('Invalid team code format.', 400); // Uses File 2 errorResponse
     }
     if (teamName.length === 0 || teamName.length > 50) {
-        return errorResponse('Team name is required (1-50 chars).', 400);
+        return errorResponse('Team name is required (1-50 chars).', 400); // Uses File 2 errorResponse
     }
 
     try {
         const existingTeam = await env.DB.prepare('SELECT 1 FROM teams WHERE code = ? LIMIT 1').bind(teamCode).first();
         if (existingTeam) {
-            return errorResponse(`Team code ${teamCode} already exists.`, 409);
+            return errorResponse(`Team code ${teamCode} already exists.`, 409); // Uses File 2 errorResponse
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -629,19 +786,19 @@ async function handleCreateTeam(request: Request, env: Env): Promise<Response> {
 
         if (!insertResult.success) {
             console.error('Create team database insert failed:', insertResult.error);
-            return errorResponse('Failed to create team due to a database issue.', 500);
+            return errorResponse('Failed to create team due to a database issue.', 500); // Uses File 2 errorResponse
         }
 
         return jsonResponse({ success: true, message: "Team created successfully.", code: teamCode, name: teamName }, 201);
 
     } catch (e: any) {
         console.error('Database error creating team:', e);
-        return errorResponse('Failed to create team.', 500, e);
+        return errorResponse('Failed to create team.', 500, e); // Uses File 2 errorResponse
     }
 }
 
 
-// GET /api/members (Public - Can filter by team_code) (Keep as is)
+// GET /api/members (Public - Can filter by team_code) (From File 1/2 - same)
 async function handleFetchMembers(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/members request...');
     try {
@@ -653,70 +810,72 @@ async function handleFetchMembers(request: Request, env: Env): Promise<Response>
             query += " WHERE team_code = ?";
             params.push(teamCode);
         }
-        const { results } = await env.DB.prepare(query).bind(...params).all<Member>(); // Use Member type
+        const { results } = await env.DB.prepare(query).bind(...params).all<Member>();
         return jsonResponse(results);
     } catch (e: any) {
         console.error("Worker: Failed to list members:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// GET /api/members/:id (Public) (Keep as is)
+// GET /api/members/:id (Public) (From File 1/2 - same)
 async function handleGetMemberById(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/members/:id request...');
     const parts = new URL(request.url).pathname.split('/');
     const memberId = parseInt(parts[3], 10);
     if (isNaN(memberId)) {
-        return errorResponse("Invalid member ID in path", 400);
+        return errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
     }
     try {
-        const member = await env.DB.prepare("SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?").bind(memberId).first<Member>(); // Use Member type
+        const member = await env.DB.prepare("SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?").bind(memberId).first<Member>();
         if (member) {
             return jsonResponse(member);
         } else {
-            return errorResponse("Member not found", 404);
+            return errorResponse("Member not found", 404); // Uses File 2 errorResponse
         }
     } catch (e: any) {
         console.error(`Worker: Failed to get member ${memberId}:`, e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
 
-// GET /api/members/me (Authenticated User) - NEW
-async function handleFetchMe(request: Request, env: Env, kindeUserId: string): Promise<Response> {
+// GET /api/members/me (Authenticated User) - NEW (Using File 2 signature, File 1 logic)
+async function handleFetchMe(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/members/me request for Kinde user ID: ${kindeUserId}`);
     try {
         // Find the member record associated with this Kinde User ID
         const member = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE kinde_user_id = ?')
             .bind(kindeUserId)
-            .first<Member>(); // Use Member type
+            .first<Member>();
 
         if (!member) {
+            console.log(`Member not found for Kinde ID ${kindeUserId}.`); // Added logging from File 2
             // Return success: true with null data if user is authenticated but not registered
             return jsonResponse({ member: null, message: "User not registered." }, 200);
         }
 
+        console.log(`Found member for Kinde ID ${kindeUserId}: ID ${member.id}`); // Added logging from File 2
         return jsonResponse({ member: member }, 200); // Wrap member in data object for ApiResponse format
 
     } catch (e: any) {
         console.error(`Database error fetching member for Kinde ID ${kindeUserId}:`, e);
-        return errorResponse('Failed to fetch member information.', 500, e);
+        return errorResponse('Failed to fetch member information.', 500, e); // Uses File 2 errorResponse
     }
 }
 
 
-// POST /api/teams/join (Authenticated User) - MODIFIED to use kindeUserId
+// POST /api/teams/join (Authenticated User) - MODIFIED to use kindeUserId (Using File 2's version)
 async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/teams/join request for Kinde user ID: ${kindeUserId}`);
     const paused = await isCollectionPaused(env);
     if (paused) {
         console.log('Collection is paused. Denying join.');
-        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403);
+        return errorResponse('现在的组队已停止，如需更多信息，请访问官网或咨询管理员。', 403); // Uses File 2 errorResponse
     }
 
     let formData: FormData;
-    try { formData = await request.formData(); } catch (e) { return errorResponse('Invalid request format. Expected multipart/form-data.', 400, e); }
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
 
     const teamCode = formData.get('teamCode')?.toString();
     const color = formData.get('color')?.toString();
@@ -727,12 +886,12 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
     const avatarFile = formData.get('avatarFile');
 
      // --- Input Validation ---
-     if (!teamCode || teamCode.length !== 4 || isNaN(parseInt(teamCode))) return errorResponse('Invalid team code.', 400);
-     if (!color || !['red', 'green', 'blue'].includes(color)) return errorResponse('Invalid color selection.', 400);
-     if (!job || !['attacker', 'defender', 'supporter'].includes(job)) return errorResponse('Invalid job selection.', 400);
-     if (!maimaiId || maimaiId.length === 0 || maimaiId.length > 13) return errorResponse('Maimai ID is required (1-13 chars).', 400);
-     if (!nickname || nickname.length === 0 || nickname.length > 50) return errorResponse('Nickname is required (1-50 chars).', 400);
-     if (!qqNumber || !/^[1-9][0-9]{4,14}$/.test(qqNumber)) return errorResponse('A valid QQ number is required.', 400);
+     if (!teamCode || teamCode.length !== 4 || isNaN(parseInt(teamCode))) return errorResponse('Invalid team code.', 400); // Uses File 2 errorResponse
+     if (!color || !['red', 'green', 'blue'].includes(color)) return errorResponse('Invalid color selection.', 400); // Uses File 2 errorResponse
+     if (!job || !['attacker', 'defender', 'supporter'].includes(job)) return errorResponse('Invalid job selection.', 400); // Uses File 2 errorResponse
+     if (!maimaiId || maimaiId.length === 0 || maimaiId.length > 13) return errorResponse('Maimai ID is required (1-13 chars).', 400); // Uses File 2 errorResponse
+     if (!nickname || nickname.length === 0 || nickname.length > 50) return errorResponse('Nickname is required (1-50 chars).', 400); // Uses File 2 errorResponse
+     if (!qqNumber || !/^[1-9][0-9]{4,14}$/.test(qqNumber)) return errorResponse('A valid QQ number is required.', 400); // Uses File 2 errorResponse
      // --- End Validation ---
 
     try {
@@ -750,28 +909,33 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
          const existingMemberWithKindeId = teamChecks[2]?.results?.[0];
          const conflictCheck = teamChecks[3]?.results?.[0];
 
-         if (!teamResult) return errorResponse(`Team with code ${teamCode} not found.`, 404);
-         if (memberCount >= 3) return errorResponse(`Team ${teamCode} is already full (3 members).`, 409);
+         if (!teamResult) return errorResponse(`Team with code ${teamCode} not found.`, 404); // Uses File 2 errorResponse
+         if (memberCount >= 3) return errorResponse(`Team ${teamCode} is already full (3 members).`, 409); // Uses File 2 errorResponse
          if (existingMemberWithKindeId) {
-             return errorResponse('你已经报名过了，一个账号只能报名一次。', 409);
+             return errorResponse('你已经报名过了，一个账号只能报名一次。', 409); // Uses File 2 errorResponse
          }
 
          if (conflictCheck) {
              const colorConflict = await env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND color = ? LIMIT 1').bind(teamCode, color).first();
-             if (colorConflict) return errorResponse(`The color '${color}' is already taken in team ${teamCode}.`, 409);
+             if (colorConflict) return errorResponse(`The color '${color}' is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
              const jobConflict = await env.DB.prepare('SELECT 1 FROM members WHERE team_code = ? AND job = ? LIMIT 1').bind(teamCode, job).first();
-             if (jobConflict) return errorResponse(`The job '${job}' is already taken in team ${teamCode}.`, 409);
+             if (jobConflict) return errorResponse(`The job '${job}' is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
              // Fallback generic conflict message if both checks pass but the batch check failed (shouldn't happen)
-             return errorResponse(`Color or job is already taken in team ${teamCode}.`, 409);
+             return errorResponse(`Color or job is already taken in team ${teamCode}.`, 409); // Uses File 2 errorResponse
          }
 
          let avatarUrl: string | null = null;
          if (avatarFile instanceof File) {
-              // Use Kinde User ID in avatar path for better uniqueness and association
-              avatarUrl = await uploadAvatar(env, avatarFile, kindeUserId, teamCode); // Use kindeUserId
+              // Use Kinde User ID in avatar path for better uniqueness and association (From File 2)
+              const idForAvatarPath = kindeUserId; // Use kindeUserId directly
+               if (!idForAvatarPath) {
+                    console.error(`Cannot determine identifier for avatar path for Kinde ID ${kindeUserId}`);
+                    return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
+               }
+              avatarUrl = await uploadAvatar(env, avatarFile, idForAvatarPath, teamCode); // Uses File 2 uploadAvatar
                if (avatarUrl === null) {
                   console.warn(`Join blocked for ${maimaiId}: Avatar upload failed.`);
-                  return errorResponse('Failed to upload avatar. Member not added.', 500);
+                  return errorResponse('Failed to upload avatar. Member not added.', 500); // Uses File 2 errorResponse
                }
          }
 
@@ -785,19 +949,23 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
 
          if (!insertResult.success) {
              console.error('Join team database insert failed:', insertResult.error);
-             return errorResponse(insertResult.error || 'Failed to add member due to a database issue.', 500);
+              if (insertResult.error?.includes('UNIQUE constraint failed')) {
+                   // This might catch unique constraints on maimai_id or kinde_user_id if they exist (From File 2)
+                   return errorResponse('Failed to add member: A record with this Maimai ID or account already exists.', 409); // Uses File 2 errorResponse
+              }
+             return errorResponse(insertResult.error || 'Failed to add member due to a database issue.', 500); // Uses File 2 errorResponse
          }
 
          const newMemberId = insertResult.meta.last_row_id;
          const newMember = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?')
              .bind(newMemberId)
-             .first<Member>(); // Use Member type
+             .first<Member>();
 
          return jsonResponse({ success: true, message: "Member added successfully.", member: newMember }, 201);
 
-    } catch (processingError) {
+    } catch (processingError: any) { // Added type any for catch error
         console.error('Error during join team processing pipeline:', processingError);
-        return errorResponse(
+        return errorResponse( // Uses File 2 errorResponse
              `Failed to process join request: ${processingError instanceof Error ? processingError.message : 'Unknown error'}`,
              500,
              processingError
@@ -805,26 +973,26 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
     }
 }
 
-// PATCH /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth
+// PATCH /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth (Using File 2's version)
 async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
      console.log(`Handling /api/members/:maimaiId PATCH request for Kinde user ID: ${kindeUserId}`);
      const parts = new URL(request.url).pathname.split('/');
      if (parts.length !== 4 || !parts[3]) {
-         return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400);
+         return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400); // Uses File 2 errorResponse
      }
      const targetMaimaiId = parts[3]; // The Maimai ID from the URL path (used to find the record)
 
     let formData: FormData;
-    try { formData = await request.formData(); } catch (e) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); }
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
 
     // --- Authorization Step ---
     // Verify the member exists AND belongs to the authenticated Kinde user
     const existingMember = await env.DB.prepare('SELECT * FROM members WHERE maimai_id = ? AND kinde_user_id = ?')
         .bind(targetMaimaiId, kindeUserId)
-        .first<Member>(); // Use Member type
+        .first<Member>();
 
     if (!existingMember) {
-        return errorResponse('Authorization failed: Member not found or does not belong to your account.', 403);
+        return errorResponse('Authorization failed: Member not found or does not belong to your account.', 403); // Uses File 2 errorResponse
     }
 
     // --- Prepare Updates ---
@@ -844,33 +1012,33 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
 
     // --- Validate and Add Fields to Update ---
     if (newNickname !== undefined && newNickname !== existingMember.nickname) {
-        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); }
+        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); } // Uses File 2 errorResponse
         updates.nickname = newNickname; setClauses.push('nickname = ?'); params.push(newNickname);
     }
     if (newQqNumber !== undefined && newQqNumber !== existingMember.qq_number) {
-        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); }
+        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); } // Uses File 2 errorResponse
         updates.qq_number = newQqNumber; setClauses.push('qq_number = ?'); params.push(newQqNumber);
     }
     // Check Color Change and Conflict (in the member's current team)
     if (newColor !== undefined && newColor !== existingMember.color) {
-        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400);
+        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400); // Uses File 2 errorResponse
         const conflictCheck = await env.DB.prepare(
                 'SELECT 1 FROM members WHERE team_code = ? AND color = ? AND id != ? LIMIT 1'
             )
             .bind(existingMember.team_code, newColor, existingMember.id)
             .first();
-        if (conflictCheck) { return errorResponse(`The color '${newColor}' is already taken by another member in your team.`, 409); }
+        if (conflictCheck) { return errorResponse(`The color '${newColor}' is already taken by another member in your team.`, 409); } // Uses File 2 errorResponse
         updates.color = newColor; setClauses.push('color = ?'); params.push(newColor);
     }
    // Check Job Change and Conflict (in the member's current team)
    if (newJob !== undefined && newJob !== existingMember.job) {
-        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400);
+        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400); // Uses File 2 errorResponse
          const conflictCheck = await env.DB.prepare(
                  'SELECT 1 FROM members WHERE team_code = ? AND job = ? AND id != ? LIMIT 1'
             )
             .bind(existingMember.team_code, newJob, existingMember.id)
             .first();
-        if (conflictCheck) { return errorResponse(`The job '${newJob}' is already taken by another member in your team.`, 409); }
+        if (conflictCheck) { return errorResponse(`The job '${newJob}' is already taken by another member in your team.`, 409); } // Uses File 2 errorResponse
         updates.job = newJob; setClauses.push('job = ?'); params.push(newJob);
    }
 
@@ -880,14 +1048,14 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
          if (existingMember.avatar_url) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     } else if (newAvatarFile instanceof File) {
        console.log(`Processing new avatar file upload for member ID ${existingMember.id}`);
-       // Use Kinde User ID in avatar path
+       // Use Kinde User ID in avatar path (From File 2)
        const idForAvatarPath = existingMember.kinde_user_id || existingMember.maimai_id; // Use Kinde ID if available
        if (!idForAvatarPath) {
             console.error(`Cannot determine identifier for avatar path for member ID ${existingMember.id}`);
-            return errorResponse('Failed to determine avatar identifier.', 500);
+            return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
        }
-       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, existingMember.team_code);
-       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); }
+       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, existingMember.team_code); // Uses File 2 uploadAvatar
+       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); } // Uses File 2 errorResponse
        newAvatarUrl = uploadedUrl; updates.avatar_url = newAvatarUrl;
        if (existingMember.avatar_url && existingMember.avatar_url !== newAvatarUrl) { oldAvatarUrlToDelete = existingMember.avatar_url; }
     }
@@ -905,22 +1073,22 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
    console.log(`Executing user update for ID ${existingMember.id}: ${updateQuery} with params: ${JSON.stringify(params.slice(0, -1))}`);
 
    try {
-       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); }
+       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); } // Uses File 2 deleteAvatarFromR2
 
         const updateResult = await env.DB.prepare(updateQuery).bind(...params).run();
 
         if (!updateResult.success) {
              console.error(`User update member database operation failed for ID ${existingMember.id}:`, updateResult.error);
               if (updateResult.error?.includes('UNIQUE constraint failed')) {
-                   return errorResponse(`Update failed due to a conflict (color or job in team). Please check values.`, 409);
+                   return errorResponse(`Update failed due to a conflict (color or job in team). Please check values.`, 409); // Uses File 2 errorResponse
               }
-             return errorResponse('Failed to update member information due to a database issue.', 500);
+             return errorResponse('Failed to update member information due to a database issue.', 500); // Uses File 2 errorResponse
         }
 
         if (updateResult.meta.changes === 0) {
             console.warn(`User update query executed for ID ${existingMember.id} but no rows were changed.`);
             const checkExists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?').bind(existingMember.id).first();
-            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404);
+            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404); // Uses File 2 errorResponse
             return jsonResponse({ message: "No changes detected or record unchanged.", member: existingMember }, 200);
         }
 
@@ -929,18 +1097,18 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
         // Fetch the *updated* member data to return
         const updatedMember = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?')
             .bind(existingMember.id)
-            .first<Member>(); // Use Member type
+            .first<Member>();
 
         if (!updatedMember) {
               console.error(`Consistency issue: Member ID ${existingMember.id} updated but could not be re-fetched.`);
-              return errorResponse('Update successful, but failed to retrieve updated data.', 500);
+              return errorResponse('Update successful, but failed to retrieve updated data.', 500); // Uses File 2 errorResponse
         }
 
         return jsonResponse({ success: true, message: "Information updated successfully.", member: updatedMember }, 200);
 
-   } catch (updateProcessError) {
+   } catch (updateProcessError: any) { // Added type any for catch error
         console.error(`Error during the user member update process for ID ${existingMember.id}:`, updateProcessError);
-        return errorResponse(
+        return errorResponse( // Uses File 2 errorResponse
              `Failed to process update: ${updateProcessError instanceof Error ? updateProcessError.message : 'Unknown error'}`,
              500,
              updateProcessError
@@ -948,12 +1116,12 @@ async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionC
    }
 }
 
-// DELETE /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth
+// DELETE /api/members/:maimaiId (Authenticated User) - MODIFIED to use kindeUserId for auth (Using File 2's version)
 async function handleUserDeleteMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     console.log(`Handling /api/members/:maimaiId DELETE request for Kinde user ID: ${kindeUserId}`);
     const parts = new URL(request.url).pathname.split('/');
     if (parts.length !== 4 || !parts[3]) {
-        return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400);
+        return errorResponse('Invalid API path. Use /api/members/:maimaiId', 400); // Uses File 2 errorResponse
     }
     const targetMaimaiId = parts[3]; // The Maimai ID from the URL path
 
@@ -964,8 +1132,8 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
         .first<{ id: number, team_code: string, avatar_url?: string | null }>();
 
     if (!existingMember) {
-        console.log(`User delete request for non-existent or unauthorized member: ${targetMaimaiId} (Kinde ID: ${kindeUserId})`);
-        return errorResponse('Member not found or does not belong to your account.', 404);
+        console.log(`User delete request for non-existent or unauthorized member: ${targetMaimaiId} (Kinde ID: ${kindeUserId})`); // Added logging from File 2
+        return errorResponse('Member not found or does not belong to your account.', 404); // Uses File 2 errorResponse
     }
 
     // --- Execute Delete ---
@@ -973,33 +1141,33 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
         const teamCode = existingMember.team_code;
         const avatarUrlToDelete = existingMember.avatar_url;
 
-        console.log(`Attempting to delete member record for ID ${existingMember.id} (Maimai ID: ${targetMaimaiId})`);
+        console.log(`Attempting to delete member record for ID ${existingMember.id} (Maimai ID: ${targetMaimaiId})`); // Added logging from File 2
         const deleteResult = await env.DB.prepare('DELETE FROM members WHERE id = ?')
             .bind(existingMember.id)
             .run();
 
         if (!deleteResult.success) {
             console.error(`User delete member database operation failed for ID ${existingMember.id}:`, deleteResult.error);
-            return errorResponse(deleteResult.error || 'Failed to delete member due to a database issue.', 500);
+            return errorResponse(deleteResult.error || 'Failed to delete member due to a database issue.', 500); // Uses File 2 errorResponse
         }
         if (deleteResult.meta.changes === 0) {
-             console.warn(`User delete query executed for ID ${existingMember.id} but no rows changed.`);
-             return errorResponse('Member not found or already deleted.', 404);
+             console.warn(`User delete query executed for ID ${existingMember.id} but no rows changed.`); // Added logging from File 2
+             return errorResponse('Member not found or already deleted.', 404); // Uses File 2 errorResponse
         }
-        console.log(`Successfully deleted member record for ID ${existingMember.id}.`);
+        console.log(`Successfully deleted member record for ID ${existingMember.id}.`); // Added logging from File 2
 
         if (avatarUrlToDelete) {
-             console.log(`Attempting to delete associated avatar: ${avatarUrlToDelete}`);
-             ctx.waitUntil(deleteAvatarFromR2(env, avatarUrlToDelete));
+             console.log(`Attempting to delete associated avatar: ${avatarUrlToDelete}`); // Added logging from File 2
+             ctx.waitUntil(deleteAvatarFromR2(env, avatarUrlToDelete)); // Uses File 2 deleteAvatarFromR2
         }
 
-       ctx.waitUntil(checkAndDeleteEmptyTeam(env, teamCode));
+       ctx.waitUntil(checkAndDeleteEmptyTeam(env, teamCode)); // Uses File 2 checkAndDeleteEmptyTeam
 
        return new Response(null, { status: 204, headers: CORS_HEADERS });
 
-    } catch (deleteProcessError) {
+    } catch (deleteProcessError: any) { // Added type any for catch error
         console.error(`Error during user member deletion process for ID ${existingMember.id}:`, deleteProcessError);
-        return errorResponse(
+        return errorResponse( // Uses File 2 errorResponse
            `Failed to process deletion: ${deleteProcessError instanceof Error ? deleteProcessError.message : 'Unknown error'}`,
             500,
             deleteProcessError
@@ -1008,8 +1176,8 @@ async function handleUserDeleteMember(request: Request, env: Env, ctx: Execution
 }
 
 
-// POST /api/member_song_preferences (Authenticated User) - MODIFIED to use kindeUserId
-async function handleSaveMemberSongPreference(request: Request, env: Env, kindeUserId: string): Promise<Response> {
+// POST /api/member_song_preferences (Authenticated User) - MODIFIED to use kindeUserId (Using File 1's logic)
+async function handleSaveMemberSongPreference(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Handling /api/member_song_preferences POST for Kinde user ID: ${kindeUserId}`);
     try {
         const payload: SaveMemberSongPreferencePayload = await request.json();
@@ -1020,22 +1188,22 @@ async function handleSaveMemberSongPreference(request: Request, env: Env, kindeU
             .first<{ id: number }>();
 
         if (!member) {
-            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden (Uses File 2 errorResponse)
         }
 
         // 2. Validate payload and ensure member_id matches the authenticated user's member ID
         if (!payload.tournament_stage || !payload.song_id || !payload.selected_difficulty || payload.member_id !== member.id) {
              // Optionally allow admin to save for other members, but for user endpoint, enforce self-save
-             return errorResponse("Invalid payload or member_id mismatch.", 400);
+             return errorResponse("Invalid payload or member_id mismatch.", 400); // Uses File 2 errorResponse
         }
 
         // 3. Check if song exists
         const songExists = await env.DB.prepare("SELECT id FROM songs WHERE id = ?").bind(payload.song_id).first();
         if (!songExists) {
-             return errorResponse("Invalid song_id.", 400);
+             return errorResponse("Invalid song_id.", 400); // Uses File 2 errorResponse
         }
 
-        // 4. Insert/Update preference (using ON CONFLICT)
+        // 4. Insert/Update preference (using ON CONFLICT) (Using File 1's ON CONFLICT clause)
         const stmt = env.DB.prepare(
             `INSERT INTO member_song_preferences (member_id, tournament_stage, song_id, selected_difficulty, created_at)
              VALUES (?, ?, ?, ?, ?)
@@ -1063,7 +1231,7 @@ async function handleSaveMemberSongPreference(request: Request, env: Env, kindeU
                     s.levels_json AS levels_json
                 FROM member_song_preferences msp
                 JOIN songs s ON msp.song_id = s.id
-                WHERE msp.member_id = ? AND msp.tournament_stage = ? AND msp.song_id = ? AND msp.selected_difficulty = ?`;
+                WHERE msp.member_id = ? AND msp.tournament_stage = ? AND msp.song_id = ? AND msp.selected_difficulty = ?`; // Match the ON CONFLICT columns
             const newPreference = await env.DB.prepare(newPreferenceQuery).bind(
                 payload.member_id,
                 payload.tournament_stage,
@@ -1082,17 +1250,17 @@ async function handleSaveMemberSongPreference(request: Request, env: Env, kindeU
             return jsonResponse(newPreference, 201);
         } else {
             console.error("Worker: Failed to save member song preference:", result.error);
-            return errorResponse(result.error || "Failed to save preference.");
+            return errorResponse(result.error || "Failed to save preference."); // Uses File 2 errorResponse
         }
 
-    } catch (e: any) {
+    } catch (e: any) { // Added type any for catch error
         console.error("Worker: Exception saving member song preference:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// GET /api/member_song_preferences?member_id=:id&stage=:stage (Authenticated User) - MODIFIED to use kindeUserId
-async function handleFetchMemberSongPreferences(request: Request, env: Env, kindeUserId: string): Promise<Response> {
+// GET /api/member_song_preferences (Authenticated User) - MODIFIED to use kindeUserId (Using File 1's logic and path)
+async function handleFetchMemberSongPreferences(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Handling /api/member_song_preferences GET for Kinde user ID: ${kindeUserId}`);
     try {
         const url = new URL(request.url);
@@ -1105,18 +1273,20 @@ async function handleFetchMemberSongPreferences(request: Request, env: Env, kind
             .first<{ id: number }>();
 
         if (!member) {
-            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden (Uses File 2 errorResponse)
         }
 
         // 2. Validate parameters and ensure member_id matches the authenticated user's member ID
         const memberIdNum = memberIdParam ? parseInt(memberIdParam, 10) : null;
 
+        // Keep File 1's validation: requires stage and member_id query params, and member_id must match auth user
         if (!stage || memberIdNum === null || isNaN(memberIdNum) || memberIdNum !== member.id) {
              // Optionally allow admin to fetch for other members, but for user endpoint, enforce self-fetch
-             return errorResponse("Invalid parameters or member_id mismatch.", 400);
+             // NOTE: File 1's logic here does NOT allow admin to fetch others. Keeping File 1's logic.
+             return errorResponse("Invalid parameters or member_id mismatch.", 400); // Uses File 2 errorResponse
         }
 
-        // 3. Fetch preferences
+        // 3. Fetch preferences (Using File 1's query with stage filter)
         const query = `
             SELECT
                 msp.*,
@@ -1141,17 +1311,17 @@ async function handleFetchMemberSongPreferences(request: Request, env: Env, kind
 
         return jsonResponse(preferencesWithDetails);
 
-    } catch (e: any) {
+    } catch (e: any) { // Added type any for catch error
         console.error("Worker: Failed to get member song preferences:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
 
 // --- Admin API Endpoints (Require Admin Auth) ---
 
-// GET /api/admin/members (Admin Only) - MODIFIED to use adminAuthMiddleware
-async function handleAdminFetchMembers(request: Request, env: Env, kindeUserId: string): Promise<Response> {
+// GET /api/admin/members (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 1 logic)
+async function handleAdminFetchMembers(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} fetching all members...`);
     // Admin authentication and isAdmin check already done by middleware
 
@@ -1159,37 +1329,214 @@ async function handleAdminFetchMembers(request: Request, env: Env, kindeUserId: 
         // Fetch all members, including kinde_user_id and is_admin
         const allMembers = await env.DB.prepare(
             'SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members ORDER BY team_code ASC, joined_at ASC'
-        ).all<Member>(); // Use Member type
+        ).all<Member>();
         return jsonResponse({ members: allMembers.results || [] }, 200);
     } catch (e: any) {
-        console.error('Database error fetching all members for admin:', e);
-        return errorResponse('Failed to fetch all members from database.', 500, e);
+        console.error(`Admin user ${kindeUserId}: Failed to list all members:`, e); // Added logging from File 2
+        return errorResponse('Failed to fetch all members from database.', 500, e); // Uses File 2 errorResponse
     }
 }
 
-// TODO: Implement other admin handlers (handleAdminAddMember, handleAdminPatchMember, handleAdminDeleteMember, handleAdminUpdateSettings)
-// These will also need to accept kindeUserId and be wrapped in adminAuthMiddleware.
-// Example signature: async function handleAdminAddMember(request: Request, env: Env, kindeUserId: string): Promise<Response> { ... }
+// GET /api/admin/members/:id (Admin Only) (From File 2)
+async function handleAdminGetMemberById(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, memberId: number): Promise<Response> { // Added memberId parameter
+    console.log(`Admin user ${kindeUserId} handling /api/admin/members/:id request for member ID ${memberId}...`);
+    // memberId is already parsed and passed by the router
+    try {
+        const member = await env.DB.prepare("SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?").bind(memberId).first<Member>();
+        if (member) {
+            return jsonResponse(member);
+        } else {
+            return errorResponse("Member not found", 404); // Uses File 2 errorResponse
+        }
+    } catch (e: any) {
+        console.error(`Admin user ${kindeUserId}: Failed to get member ${memberId}:`, e); // Added logging from File 2
+        return errorResponse(e.message); // Uses File 2 errorResponse
+    }
+}
+
+// PATCH /api/admin/members/:id (Admin Only) (From File 2)
+async function handleAdminPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, targetMemberId: number): Promise<Response> { // Added targetMemberId parameter
+    console.log(`Admin user ${kindeUserId} handling /api/admin/members/:id PATCH request for member ID ${targetMemberId}...`);
+    // targetMemberId is already parsed and passed by the router
+
+    let formData: FormData;
+    try { formData = await request.formData(); } catch (e: any) { return errorResponse('Invalid request format for update. Expected multipart/form-data.', 400, e); } // Uses File 2 errorResponse
+
+    // --- Find Member ---
+    const existingMember = await env.DB.prepare('SELECT * FROM members WHERE id = ?')
+        .bind(targetMemberId)
+        .first<Member>();
+
+    if (!existingMember) {
+        return errorResponse('Member not found.', 404); // Uses File 2 errorResponse
+    }
+
+    // --- Prepare Updates ---
+    const updates: Partial<Member> = {};
+    const setClauses: string[] = [];
+    const params: (string | number | null)[] = [];
+    let newAvatarUrl: string | null | undefined = undefined;
+    let oldAvatarUrlToDelete: string | null | undefined = undefined;
+
+    // Get potential new values from FormData
+    const newTeamCode = formData.get('teamCode')?.toString()?.trim();
+    const newColor = formData.get('color')?.toString();
+    const newJob = formData.get('job')?.toString();
+    const newMaimaiId = formData.get('maimaiId')?.toString()?.trim();
+    const newNickname = formData.get('nickname')?.toString()?.trim();
+    const newQqNumber = formData.get('qqNumber')?.toString()?.trim();
+    const newKindeUserId = formData.get('kindeUserId')?.toString()?.trim(); // Admin can update Kinde ID
+    const newIsAdmin = formData.get('isAdmin')?.toString(); // Admin can update admin status
+    const newAvatarFile = formData.get('avatarFile');
+    const clearAvatar = formData.get('clearAvatar')?.toString() === 'true';
+
+
+    // --- Validate and Add Fields to Update ---
+    if (newTeamCode !== undefined && newTeamCode !== existingMember.team_code) {
+        if (newTeamCode.length !== 4 || isNaN(parseInt(newTeamCode))) { return errorResponse('Invalid new team code format.', 400); } // Uses File 2 errorResponse
+        // Check if new team exists
+        const teamExists = await env.DB.prepare('SELECT 1 FROM teams WHERE code = ? LIMIT 1').bind(newTeamCode).first();
+        if (!teamExists) { return errorResponse(`New team code ${newTeamCode} not found.`, 404); } // Uses File 2 errorResponse
+        updates.team_code = newTeamCode; setClauses.push('team_code = ?'); params.push(newTeamCode);
+    }
+    if (newColor !== undefined && newColor !== existingMember.color) {
+        if (!['red', 'green', 'blue'].includes(newColor)) return errorResponse('Invalid new color selection.', 400); // Uses File 2 errorResponse
+        // Check color conflict in the *new* team if teamCode is changing, otherwise in the current team
+        const targetTeamCodeForConflictCheck = newTeamCode !== undefined ? newTeamCode : existingMember.team_code;
+         const colorConflict = await env.DB.prepare(
+                 'SELECT 1 FROM members WHERE team_code = ? AND color = ? AND id != ? LIMIT 1'
+            )
+            .bind(targetTeamCodeForConflictCheck, newColor, existingMember.id)
+            .first();
+        if (colorConflict) { return errorResponse(`The color '${newColor}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); } // Uses File 2 errorResponse
+        updates.color = newColor; setClauses.push('color = ?'); params.push(newColor);
+    }
+   if (newJob !== undefined && newJob !== existingMember.job) {
+        if (!['attacker', 'defender', 'supporter'].includes(newJob)) return errorResponse('Invalid new job selection.', 400); // Uses File 2 errorResponse
+        // Check job conflict in the *new* team if teamCode is changing, otherwise in the current team
+        const targetTeamCodeForConflictCheck = newTeamCode !== undefined ? newTeamCode : existingMember.team_code;
+         const jobConflict = await env.DB.prepare(
+                 'SELECT 1 FROM members WHERE team_code = ? AND job = ? AND id != ? LIMIT 1'
+            )
+            .bind(targetTeamCodeForConflictCheck, newJob, existingMember.id)
+            .first();
+        if (jobConflict) { return errorResponse(`The job '${newJob}' is already taken by another member in team ${targetTeamCodeForConflictCheck}.`, 409); } // Uses File 2 errorResponse
+        updates.job = newJob; setClauses.push('job = ?'); params.push(newJob);
+   }
+    if (newMaimaiId !== undefined && newMaimaiId !== existingMember.maimai_id) {
+        if (newMaimaiId.length === 0 || newMaimaiId.length > 13) { return errorResponse('Maimai ID must be between 1 and 13 characters.', 400); } // Uses File 2 errorResponse
+        // Check if new Maimai ID is already taken by someone else
+        const maimaiIdConflict = await env.DB.prepare('SELECT 1 FROM members WHERE maimai_id = ? AND id != ? LIMIT 1').bind(newMaimaiId, existingMember.id).first();
+        if (maimaiIdConflict) { return errorResponse(`Maimai ID ${newMaimaiId} is already registered.`, 409); } // Uses File 2 errorResponse
+        updates.maimai_id = newMaimaiId; setClauses.push('maimai_id = ?'); params.push(newMaimaiId);
+    }
+    if (newNickname !== undefined && newNickname !== existingMember.nickname) {
+        if (newNickname.length === 0 || newNickname.length > 50) { return errorResponse('Nickname must be between 1 and 50 characters.', 400); } // Uses File 2 errorResponse
+        updates.nickname = newNickname; setClauses.push('nickname = ?'); params.push(newNickname);
+    }
+    if (newQqNumber !== undefined && newQqNumber !== existingMember.qq_number) {
+        if (!/^[1-9][0-9]{4,14}$/.test(newQqNumber)) { return errorResponse('Invalid format for new QQ number.', 400); } // Uses File 2 errorResponse
+        updates.qq_number = newQqNumber; setClauses.push('qq_number = ?'); params.push(newQqNumber);
+    }
+    if (newKindeUserId !== undefined && newKindeUserId !== existingMember.kinde_user_id) {
+         // Allow setting to null/empty string to unlink Kinde account
+         if (newKindeUserId !== null && newKindeUserId !== '' && newKindeUserId.length > 100) { return errorResponse('Kinde User ID is too long.', 400); } // Uses File 2 errorResponse
+         // Check if new Kinde User ID is already linked to another member
+         if (newKindeUserId !== null && newKindeUserId !== '') {
+              const kindeIdConflict = await env.DB.prepare('SELECT 1 FROM members WHERE kinde_user_id = ? AND id != ? LIMIT 1').bind(newKindeUserId, existingMember.id).first();
+              if (kindeIdConflict) { return errorResponse(`Kinde User ID ${newKindeUserId} is already linked to another member.`, 409); } // Uses File 2 errorResponse
+         }
+         updates.kinde_user_id = newKindeUserId === '' ? null : newKindeUserId; setClauses.push('kinde_user_id = ?'); params.push(updates.kinde_user_id);
+    }
+    if (newIsAdmin !== undefined) {
+         const isAdminValue = newIsAdmin === 'true' || newIsAdmin === '1';
+         const isAdminInt = isAdminValue ? 1 : 0;
+         if (isAdminInt !== existingMember.is_admin) {
+              updates.is_admin = isAdminInt; setClauses.push('is_admin = ?'); params.push(isAdminInt);
+         }
+    }
+
+    // --- Handle Avatar Changes (Admin can update any member's avatar) ---
+    if (clearAvatar) {
+         newAvatarUrl = null; updates.avatar_url = null;
+         if (existingMember.avatar_url) { oldAvatarUrlToDelete = existingMember.avatar_url; }
+    } else if (newAvatarFile instanceof File) {
+       console.log(`Admin processing new avatar file upload for member ID ${existingMember.id}`); // Added logging from File 2
+       // Use Kinde User ID or Maimai ID for avatar path (From File 2)
+       const idForAvatarPath = existingMember.kinde_user_id || existingMember.maimai_id || targetMemberId.toString(); // Fallback to internal ID
+       if (!idForAvatarPath) {
+            console.error(`Cannot determine identifier for avatar path for member ID ${existingMember.id}`);
+            return errorResponse('Failed to determine avatar identifier.', 500); // Uses File 2 errorResponse
+       }
+       const targetTeamCodeForAvatar = newTeamCode !== undefined ? newTeamCode : existingMember.team_code; // Use new team code if changing
+       const uploadedUrl = await uploadAvatar(env, newAvatarFile, idForAvatarPath, targetTeamCodeForAvatar); // Uses File 2 uploadAvatar
+       if (uploadedUrl === null) { return errorResponse('Avatar upload failed. Profile update cancelled.', 500); } // Uses File 2 errorResponse
+       newAvatarUrl = uploadedUrl; updates.avatar_url = newAvatarUrl;
+       if (existingMember.avatar_url && existingMember.avatar_url !== newAvatarUrl) { oldAvatarUrlToDelete = existingMember.avatar_url; }
+    }
+    if (newAvatarUrl !== undefined) { setClauses.push('avatar_url = ?'); params.push(newAvatarUrl); }
+
+
+   if (setClauses.length === 0) { return jsonResponse({ message: "No changes detected.", member: existingMember }, 200); }
+
+   const now = Math.floor(Date.now() / 1000);
+   setClauses.push('updated_at = ?'); params.push(now);
+
+   params.push(existingMember.id); // Use internal ID for WHERE clause
+
+   const updateQuery = `UPDATE members SET ${setClauses.join(', ')} WHERE id = ?`;
+   console.log(`Executing admin update for ID ${existingMember.id}: ${updateQuery} with params: ${JSON.stringify(params.slice(0, -1))}`); // Added logging from File 2
+
+   try {
+       if (oldAvatarUrlToDelete) { ctx.waitUntil(deleteAvatarFromR2(env, oldAvatarUrlToDelete)); } // Uses File 2 deleteAvatarFromR2
+
+        const updateResult = await env.DB.prepare(updateQuery).bind(...params).run();
+
+        if (!updateResult.success) {
+             console.error(`Admin update member database operation failed for ID ${existingMember.id}:`, updateResult.error); // Added logging from File 2
+              if (updateResult.error?.includes('UNIQUE constraint failed')) {
+                   return errorResponse(`Update failed due to a conflict (color, job, maimai ID, or Kinde ID). Please check values.`, 409); // Uses File 2 errorResponse
+              }
+             return errorResponse('Failed to update member information due to a database issue.', 500); // Uses File 2 errorResponse
+        }
+
+        if (updateResult.meta.changes === 0) {
+            console.warn(`Admin update query executed for ID ${existingMember.id} but no rows were changed.`); // Added logging from File 2
+            const checkExists = await env.DB.prepare('SELECT 1 FROM members WHERE id = ?').bind(existingMember.id).first();
+            if (!checkExists) return errorResponse('Failed to update: Member record not found.', 404); // Uses File 2 errorResponse
+            return jsonResponse({ message: "No changes detected or record unchanged.", member: existingMember }, 200);
+        }
+
+        console.log(`Successfully updated member ID ${existingMember.id}. Changes: ${updateResult.meta.changes}`); // Added logging from File 2
+
+        // Fetch the *updated* member data to return
+        const updatedMember = await env.DB.prepare('SELECT id, team_code, color, job, maimai_id, nickname, qq_number, avatar_url, joined_at, updated_at, kinde_user_id, is_admin FROM members WHERE id = ?')
+            .bind(existingMember.id)
+            .first<Member>();
+
+        if (!updatedMember) {
+              console.error(`Consistency issue: Member ID ${existingMember.id} updated but could not be re-fetched.`); // Added logging from File 2
+              return errorResponse('Update successful, but failed to retrieve updated data.', 500); // Uses File 2 errorResponse
+        }
+
+        return jsonResponse({ success: true, message: "Information updated successfully.", member: updatedMember }, 200);
+
+   } catch (updateProcessError: any) { // Added type any for catch error
+        console.error(`Error during the admin member update process for ID ${existingMember.id}:`, updateProcessError); // Added logging from File 2
+        return errorResponse( // Uses File 2 errorResponse
+             `Failed to process update: ${updateProcessError instanceof Error ? updateProcessError.message : 'Unknown error'}`,
+             500,
+             updateProcessError
+        );
+   }
+}
+
+// TODO: Implement handleAdminAddMember, handleAdminDeleteMember, handleAdminUpdateSettings (These were TODOs in File 1)
 
 
 // --- Tournament/Match API Handlers ---
-// Decide which of these require authentication (likely all except maybe GET list)
-// fetchTournamentMatches (GET /api/tournament_matches) - Public (already handled)
-// createTournamentMatch (POST /api/tournament_matches) - Requires Admin Auth
-// confirmMatchSetup (PUT /api/tournament_matches/:id/confirm_setup) - Requires Admin Auth
-// startLiveMatch (POST /api/tournament_matches/:id/start_live) - Requires Admin Auth
-// fetchMatchState (GET /api/live-match/:doId/state) - Public (already handled)
-// WebSocket (GET /api/live-match/:doId/websocket) - Public (already handled)
-// calculateRound (POST /api/live-match/:doId/calculate-round) - Requires Admin Auth
-// nextRound (POST /api/live-match/:doId/next-round) - Requires Admin Auth
-// archiveMatch (POST /api/live-match/:doId/archive) - Requires Admin Auth
-// resolveDraw (POST /api/live-match/:doId/resolve-draw) - Requires Admin Auth
-// selectTiebreakerSong (POST /api/live-match/:doId/select-tiebreaker-song) - Requires Admin Auth
-// fetchMatchHistory (GET /api/match_history) - Public (already handled)
-
-
-// POST /api/tournament_matches (Admin Only) - MODIFIED to use adminAuthMiddleware
-async function handleCreateTournamentMatch(request: Request, env: Env, kindeUserId: string): Promise<Response> {
+// POST /api/tournament_matches (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
+async function handleCreateTournamentMatch(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/tournament_matches POST request...`);
     try {
         interface SimpleCreateTournamentMatchPayload {
@@ -1201,12 +1548,12 @@ async function handleCreateTournamentMatch(request: Request, env: Env, kindeUser
         const payload: SimpleCreateTournamentMatchPayload = await request.json();
 
         if (!payload.round_name || payload.team1_id === null || payload.team2_id === null) {
-             return errorResponse("Missing required fields: round_name, team1_id, team2_id", 400);
+             return errorResponse("Missing required fields: round_name, team1_id, team2_id", 400); // Uses File 2 errorResponse
         } else {
             const team1 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team1_id).first();
             const team2 = await env.DB.prepare("SELECT id FROM teams WHERE id = ?").bind(payload.team2_id).first();
             if (!team1 || !team2) {
-                 return errorResponse("Invalid team1_id or team2_id", 400);
+                 return errorResponse("Invalid team1_id or team2_id", 400); // Uses File 2 errorResponse
             } else {
                 const stmt = env.DB.prepare(
                     `INSERT INTO tournament_matches (round_name, team1_id, team2_id, scheduled_time, status, created_at, updated_at)
@@ -1227,18 +1574,18 @@ async function handleCreateTournamentMatch(request: Request, env: Env, kindeUser
                     return jsonResponse(newMatch, 201);
                 } else {
                     console.error("Worker: Failed to create tournament match:", result.error);
-                    return errorResponse(result.error || "Failed to create match.");
+                    return errorResponse(result.error || "Failed to create match."); // Uses File 2 errorResponse
                 }
             }
         }
-    } catch (e: any) {
+    } catch (e: any) { // Added type any for catch error
         console.error("Worker: Exception creating tournament match:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// PUT /api/tournament_matches/:id/confirm_setup (Admin Only) - MODIFIED to use adminAuthMiddleware
-async function handleConfirmMatchSetup(request: Request, env: Env, kindeUserId: string, tournamentMatchId: number): Promise<Response> {
+// PUT /api/tournament_matches/:id/confirm_setup (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
+async function handleConfirmMatchSetup(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, tournamentMatchId: number): Promise<Response> { // Added ctx parameter for middleware compatibility
      console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${tournamentMatchId}/confirm_setup PUT request...`);
      try {
          interface ConfirmSetupPayload {
@@ -1249,13 +1596,13 @@ async function handleConfirmMatchSetup(request: Request, env: Env, kindeUserId: 
          const payload: ConfirmSetupPayload = await request.json();
 
          if (!Array.isArray(payload.team1_player_order) || !Array.isArray(payload.team2_player_order) || !Array.isArray(payload.match_song_list) || payload.team1_player_order.length === 0 || payload.team2_player_order.length === 0 || payload.match_song_list.length === 0) {
-             return errorResponse("Invalid payload: player orders and song list must be non-empty arrays.", 400);
+             return errorResponse("Invalid payload: player orders and song list must be non-empty arrays.", 400); // Uses File 2 errorResponse
          } else {
              const match = await env.DB.prepare("SELECT * FROM tournament_matches WHERE id = ?").bind(tournamentMatchId).first<TournamentMatch>();
              if (!match) {
-                 return errorResponse("Tournament match not found.", 404);
+                 return errorResponse("Tournament match not found.", 404); // Uses File 2 errorResponse
              } else if (match.status !== 'scheduled' && match.status !== 'pending_song_confirmation') {
-                  return errorResponse(`Match status is '${match.status}'. Must be 'scheduled' or 'pending_song_confirmation' to confirm setup.`, 400);
+                  return errorResponse(`Match status is '${match.status}'. Must be 'scheduled' or 'pending_song_confirmation' to confirm setup.`, 400); // Uses File 2 errorResponse
              } else {
                  const stmt = env.DB.prepare(
                      `UPDATE tournament_matches SET
@@ -1280,18 +1627,18 @@ async function handleConfirmMatchSetup(request: Request, env: Env, kindeUserId: 
                      return jsonResponse(updatedMatch);
                  } else {
                      console.error("Worker: Failed to confirm match setup:", result.error);
-                     return errorResponse(result.error || "Failed to confirm setup.");
+                     return errorResponse(result.error || "Failed to confirm setup."); // Uses File 2 errorResponse
                  }
              }
          }
-     } catch (e: any) {
+     } catch (e: any) { // Added type any for catch error
          console.error(`Worker: Exception confirming match setup ${tournamentMatchId}:`, e);
-         return errorResponse(e.message);
+         return errorResponse(e.message); // Uses File 2 errorResponse
      }
 }
 
-// POST /api/tournament_matches/:id/start_live (Admin Only) - MODIFIED to use adminAuthMiddleware
-async function handleStartLiveMatch(request: Request, env: Env, kindeUserId: string, tournamentMatchId: number): Promise<Response> {
+// POST /api/tournament_matches/:id/start_live (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's version)
+async function handleStartLiveMatch(request: Request, env: Env, ctx: ExecutionContext, tournamentMatchId: number): Promise<Response> { // Added ctx parameter for middleware compatibility
      console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${tournamentMatchId}/start_live POST request...`);
      try {
          const match = await env.DB.prepare(
@@ -1303,32 +1650,32 @@ async function handleStartLiveMatch(request: Request, env: Env, kindeUserId: str
          ).bind(tournamentMatchId).first<TournamentMatch>();
 
          if (!match) {
-             return errorResponse("Scheduled match not found", 404);
+             return errorResponse("Scheduled match not found", 404); // Uses File 2 errorResponse
          } else if (match.status === 'live' && match.match_do_id) {
              console.log(`Worker: Match ${tournamentMatchId} is already live with DO ${match.match_do_id}. Returning existing DO ID.`);
              return jsonResponse({ message: "Match is already live.", match_do_id: match.match_do_id });
          } else if (match.status !== 'ready_to_start') {
-              return errorResponse(`Match status is '${match.status}'. Must be 'ready_to_start' to start live.`, 400);
+              return errorResponse(`Match status is '${match.status}'. Must be 'ready_to_start' to start live.`, 400); // Uses File 2 errorResponse
          } else if (!match.team1_player_order_json || !match.team2_player_order_json || !match.match_song_list_json) {
-              return errorResponse("Match setup is incomplete (player order or song list missing).", 400);
+              return errorResponse("Match setup is incomplete (player order or song list missing).", 400); // Uses File 2 errorResponse
          } else {
              const team1 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team1_id).first<{ code: string }>();
              const team2 = await env.DB.prepare("SELECT code FROM teams WHERE id = ?").bind(match.team2_id).first<{ code: string }>();
              if (!team1 || !team2) {
-                  return errorResponse("Could not fetch team codes for members.", 500);
+                  return errorResponse("Could not fetch team codes for members.", 500); // Uses File 2 errorResponse
              } else {
                  const team1Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team1.code).all<Member>();
                  const team2Members = await env.DB.prepare("SELECT * FROM members WHERE team_code = ?").bind(team2.code).all<Member>();
 
                  if (!team1Members.results || team1Members.results.length === 0 || !team2Members.results || team2Members.results.length === 0) {
-                       return errorResponse("One or both teams have no members assigned.", 400);
+                       return errorResponse("One or both teams have no members assigned.", 400); // Uses File 2 errorResponse
                   } else {
                      const team1PlayerOrderIds: number[] = JSON.parse(match.team1_player_order_json);
                      const team2PlayerOrderIds: number[] = JSON.parse(match.team2_player_order_json);
                      const matchSongList: MatchSong[] = JSON.parse(match.match_song_list_json);
 
                      if (!Array.isArray(team1PlayerOrderIds) || !Array.isArray(team2PlayerOrderIds) || !Array.isArray(matchSongList) || team1PlayerOrderIds.length === 0 || team2PlayerOrderIds.length === 0 || matchSongList.length === 0) {
-                          return errorResponse("Parsed setup data is invalid.", 500);
+                          return errorResponse("Parsed setup data is invalid.", 500); // Uses File 2 errorResponse
                      } else {
                          const doIdString = `match-${tournamentMatchId}`;
                          const doStub = getMatchDO(doIdString, env);
@@ -1346,7 +1693,7 @@ async function handleStartLiveMatch(request: Request, env: Env, kindeUserId: str
                              match_song_list: matchSongList,
                          };
 
-                         // Forward initialization request to the DO
+                         // Forward initialization request to the DO (Uses File 2 forwardRequestToDO with bodyData)
                          const doResponse = await forwardRequestToDO(doIdString, env, request, '/internal/initialize-from-schedule', 'POST', initPayload);
 
                          if (doResponse.ok) {
@@ -1359,94 +1706,94 @@ async function handleStartLiveMatch(request: Request, env: Env, kindeUserId: str
                                   return jsonResponse({ message: "Match started live.", match_do_id: doIdString, do_init_result: doResult });
                              } else {
                                   console.error(`Worker: Failed to update tournament_matches status for ${tournamentMatchId}:`, updateResult.error);
-                                  return errorResponse(`Match started live in DO, but failed to update schedule status: ${updateResult.error}`, 500);
+                                  return errorResponse(`Match started live in DO, but failed to update schedule status: ${updateResult.error}`, 500); // Uses File 2 errorResponse
                              }
                          } else {
                              const errorBody = await doResponse.json();
                              console.error(`Worker: Failed to initialize DO ${doIdString} for match ${tournamentMatchId}:`, errorBody);
-                             return errorResponse(`Failed to initialize live match in Durable Object: ${errorBody.message || errorBody.error}`, doResponse.status);
+                             return errorResponse(`Failed to initialize live match in Durable Object: ${errorBody.message || errorBody.error}`, doResponse.status); // Uses File 2 errorResponse
                          }
                      }
                   }
              }
          }
-     } catch (e: any) {
+     } catch (e: any) { // Added type any for catch error
          console.error(`Worker: Exception starting live match ${tournamentMatchId}:`, e);
-         return errorResponse(`Exception starting live match: ${e.message}`);
+         return errorResponse(`Exception starting live match: ${e.message}`); // Uses File 2 errorResponse
      }
 }
 
-// Live Match DO Actions (Admin Only) - MODIFIED to use adminAuthMiddleware
+// Live Match DO Actions (Admin Only) - MODIFIED to use adminAuthMiddleware (Using File 2's versions)
 // These handlers read the body and then call forwardRequestToDO
-async function handleAdminCalculateRound(request: Request, env: Env, kindeUserId: string, doIdString: string): Promise<Response> {
+async function handleAdminCalculateRound(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/calculate-round POST request...`);
     try {
         const payload: CalculateRoundPayload = await request.json();
         if (typeof payload.teamA_percentage !== 'number' || typeof payload.teamB_percentage !== 'number') {
-             return errorResponse("Invalid payload: teamA_percentage and teamB_percentage must be numbers.", 400);
+             return errorResponse("Invalid payload: teamA_percentage and teamB_percentage must be numbers.", 400); // Uses File 2 errorResponse
         }
         // Forward the request to the DO. forwardRequestToDO will handle reading the body again.
         // A better approach is to read the body *once* here and pass it to forwardRequestToDO.
         // Let's modify forwardRequestToDO to accept an optional body parameter. (Already done above)
-        return forwardRequestToDO(doIdString, env, request, '/internal/calculate-round', 'POST', payload);
-    } catch (e: any) {
+        return forwardRequestToDO(doIdString, env, request, '/internal/calculate-round', 'POST', payload); // Uses File 2 forwardRequestToDO with bodyData
+    } catch (e: any) { // Added type any for catch error
         console.error(`Worker: Exception processing calculate-round payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400);
+        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
     }
 }
 
-async function handleAdminNextRound(request: Request, env: Env, kindeUserId: string, doIdString: string): Promise<Response> {
+async function handleAdminNextRound(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/next-round POST request...`);
-    // Forward the request to the DO
+    // Forward the request to the DO (Uses File 2 forwardRequestToDO)
     return forwardRequestToDO(doIdString, env, request, '/internal/next-round', 'POST');
 }
 
-async function handleAdminArchiveMatch(request: Request, env: Env, kindeUserId: string, doIdString: string): Promise<Response> {
+async function handleAdminArchiveMatch(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/archive POST request...`);
-    // Forward the request to the DO
+    // Forward the request to the DO (Uses File 2 forwardRequestToDO)
     return forwardRequestToDO(doIdString, env, request, '/internal/archive-match', 'POST');
 }
 
-async function handleAdminResolveDraw(request: Request, env: Env, kindeUserId: string, doIdString: string): Promise<Response> {
+async function handleAdminResolveDraw(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/resolve-draw POST request...`);
     try {
         const payload: ResolveDrawPayload = await request.json();
         if (payload.winner !== 'teamA' && payload.winner !== 'teamB') {
-             return errorResponse("Invalid payload: winner must be 'teamA' or 'teamB'.", 400);
+             return errorResponse("Invalid payload: winner must be 'teamA' or 'teamB'.", 400); // Uses File 2 errorResponse
          }
-        // Forward the request to the DO
+        // Forward the request to the DO (Uses File 2 forwardRequestToDO with bodyData)
         return forwardRequestToDO(doIdString, env, request, '/internal/resolve-draw', 'POST', payload);
-    } catch (e: any) {
+    } catch (e: any) { // Added type any for catch error
         console.error(`Worker: Exception processing resolve-draw payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400);
+        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
     }
 }
 
-async function handleAdminSelectTiebreakerSong(request: Request, env: Env, kindeUserId: string, doIdString: string): Promise<Response> {
+async function handleAdminSelectTiebreakerSong(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string, doIdString: string): Promise<Response> { // Added ctx parameter for middleware compatibility
     console.log(`Admin user ${kindeUserId} handling /api/live-match/${doIdString}/select-tiebreaker-song POST request...`);
     try {
         const payload: SelectTiebreakerSongPayload = await request.json();
         if (typeof payload.song_id !== 'number' || typeof payload.selected_difficulty !== 'string') {
-            return errorResponse("Invalid select-tiebreaker-song payload: song_id (number) and selected_difficulty (string) are required.", 400);
+            return errorResponse("Invalid select-tiebreaker-song payload: song_id (number) and selected_difficulty (string) are required.", 400); // Uses File 2 errorResponse
         }
         // Before forwarding, fetch song details from D1 to pass to DO
         const song = await env.DB.prepare("SELECT * FROM songs WHERE id = ?").bind(payload.song_id).first<Song>();
         if (!song) {
-             return errorResponse(`Song with ID ${payload.song_id} not found in D1.`, 404);
+             return errorResponse(`Song with ID ${payload.song_id} not found in D1.`, 404); // Uses File 2 errorResponse
          }
          // Pass song details along with selection to DO
         const doPayload = { song_id: payload.song_id, selected_difficulty: payload.selected_difficulty, song_details: song };
-        // Forward the request to the DO
+        // Forward the request to the DO (Uses File 2 forwardRequestToDO with bodyData)
         return forwardRequestToDO(doIdString, env, request, '/internal/select-tiebreaker-song', 'POST', doPayload);
-    } catch (e: any) {
+    } catch (e: any) { // Added type any for catch error
         console.error(`Worker: Exception processing select-tiebreaker-song payload for DO ${doIdString}:`, e);
-        return errorResponse(`Invalid payload format: ${e.message}`, 400);
+        return errorResponse(`Invalid payload format: ${e.message}`, 400); // Uses File 2 errorResponse
     }
 }
 
 
-// --- Song Endpoints (Public) ---
-// handleFetchSongs (GET /api/songs) (Keep as is)
+// --- Song Endpoints (Public) (Using File 1's logic) ---
+// handleFetchSongs (GET /api/songs) (From File 1)
 async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/songs request...');
     try {
@@ -1467,6 +1814,7 @@ async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
          if (search) { baseQuery += " AND title LIKE ?"; params.push(`%${search}%`); countParams.push(`%${search}%`); }
 
          const countQuery = `SELECT COUNT(*) as total ${baseQuery}`;
+         // Using SELECT * as in File 1, relies on DB schema having necessary columns
          const dataQuery = `SELECT * ${baseQuery} ORDER BY title ASC LIMIT ? OFFSET ?`;
          params.push(limit, offset);
 
@@ -1475,16 +1823,30 @@ async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
 
         const [{ total }, { results }] = await Promise.all([
             countStmt.first<{ total: number }>(),
-            dataStmt.all<Song>()
+            dataStmt.all<Song>() // Assuming Song type matches SELECT * results
         ]);
 
         const songsWithDetails = results.map((song) => {
             if (!song) return null;
-            const parsedLevels = song.levels_json ? JSON.parse(song.levels_json) as SongLevel : undefined;
-            const fullCoverUrl = song.cover_filename && env.R2_PUBLIC_BUCKET_URL
-                ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
+            // Need to ensure 'levels_json' and 'cover_filename' exist in DB for this mapping
+            // Cast to any to access properties that might not be strictly in the base Song type if SELECT * returns more
+            const parsedLevels = (song as any).levels_json ? JSON.parse((song as any).levels_json) as SongLevel : undefined;
+            const fullCoverUrl = (song as any).cover_filename && env.R2_PUBLIC_BUCKET_URL
+                ? `${env.R2_PUBLIC_BUCKET_URL}/${(song as any).cover_filename}`
                 : undefined;
-            return { ...song, parsedLevels, fullCoverUrl };
+             // Explicitly include fields expected by frontend, assuming SELECT * returns them
+             // If 'artist' is NOT in your DB, this will be undefined, which is fine if frontend handles it.
+             return {
+                 id: song.id,
+                 title: song.title,
+                 artist: (song as any).artist, // Assuming 'artist' is returned by SELECT * (if it exists)
+                 genre: (song as any).genre,   // Assuming 'genre' is returned by SELECT *
+                 version: (song as any).version, // Assuming 'version' is returned by SELECT *
+                 bpm: (song as any).bpm,       // Assuming 'bpm' is returned by SELECT *
+                 parsedLevels: parsedLevels,
+                 fullCoverUrl: fullCoverUrl,
+                 // Add other fields from your Song type if needed and returned by SELECT *
+             };
         }).filter(song => song !== null) as Song[]; // Cast back to Song[]
 
         const pagination: PaginationInfo = {
@@ -1499,14 +1861,15 @@ async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
     } catch (e: any) {
         console.error("Worker: Failed to list songs:", e);
         if (e.cause) { console.error("Worker: D1 Error Cause:", e.cause); }
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// handleFetchSongFilterOptions (GET /api/songs/filters) (Keep as is)
+// handleFetchSongFilterOptions (GET /api/songs/filters) (From File 1)
 async function handleFetchSongFilterOptions(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/songs/filters request...');
     try {
+        // File 1 only fetches category and type
         const categoryQuery = "SELECT DISTINCT category FROM songs WHERE category IS NOT NULL AND category != '' ORDER BY category";
         const typeQuery = "SELECT DISTINCT type FROM songs WHERE type IS NOT NULL AND type != '' ORDER BY type";
 
@@ -1521,16 +1884,17 @@ async function handleFetchSongFilterOptions(request: Request, env: Env): Promise
         const categoryList = categories.map(c => c.category).filter(Boolean);
         const typeList = types.map(t => t.type).filter(Boolean);
 
+        // File 1's response structure for filters
         return jsonResponse<SongFiltersApiResponseData>({ categories: categoryList, types: typeList });
 
     } catch (e: any) {
         console.error("Worker: Failed to get song filter options:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
 
-// handleFetchTournamentMatches (GET /api/tournament_matches) (Public) (Keep as is)
+// handleFetchTournamentMatches (GET /api/tournament_matches) (Public) (From File 1/2 - same)
 async function handleFetchTournamentMatches(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/tournament_matches request...');
     try {
@@ -1564,11 +1928,11 @@ async function handleFetchTournamentMatches(request: Request, env: Env): Promise
     } catch (e: any) {
         console.error("Worker: Failed to list tournament matches:", e);
         if (e.cause) { console.error("Worker: D1 Error Cause:", e.cause); }
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
-// handleFetchMatchHistory (GET /api/match_history) (Public) (Keep as is)
+// handleFetchMatchHistory (GET /api/match_history) (Public) (From File 1/2 - same)
 async function handleFetchMatchHistory(request: Request, env: Env): Promise<Response> {
     console.log('Handling /api/match_history request...');
     try {
@@ -1633,7 +1997,7 @@ async function handleFetchMatchHistory(request: Request, env: Env): Promise<Resp
 
     } catch (e: any) {
         console.error("Worker: Failed to fetch match history:", e);
-        return errorResponse(e.message);
+        return errorResponse(e.message); // Uses File 2 errorResponse
     }
 }
 
@@ -1645,7 +2009,7 @@ export default {
         const method = request.method;
         const pathname = url.pathname;
 
-        // Handle CORS preflight requests (Keep as is)
+        // Handle CORS preflight requests (From File 1/2 - same)
         if (method === 'OPTIONS') {
             return new Response(null, { headers: CORS_HEADERS });
         }
@@ -1656,8 +2020,10 @@ export default {
         if (method === 'GET' && pathname === '/api/settings') {
             responseFromRoute = await handleGetSettings(request, env);
         } else if (method === 'POST' && pathname === '/api/kinde/callback') {
+            // Kinde Callback (From File 2)
             responseFromRoute = await handleKindeCallback(request, env, ctx);
         } else if (method === 'GET' && pathname === '/api/logout') {
+             // Kinde Logout (From File 2)
              responseFromRoute = await handleLogout(request, env);
         } else if (method === 'POST' && pathname === '/api/teams/check') {
             responseFromRoute = await handleCheckTeam(request, env);
@@ -1666,119 +2032,142 @@ export default {
         } else if (method === 'GET' && pathname.match(/^\/api\/teams\/[0-9]{4}$/)) {
              responseFromRoute = await handleGetTeamByCode(request, env);
         } else if (method === 'GET' && pathname === '/api/songs') {
+             // Song List (From File 1 logic)
              responseFromRoute = await handleFetchSongs(request, env);
         } else if (method === 'GET' && pathname === '/api/songs/filters') {
+             // Song Filters (From File 1 logic)
              responseFromRoute = await handleFetchSongFilterOptions(request, env);
         } else if (method === 'GET' && pathname === '/api/tournament_matches') {
              responseFromRoute = await handleFetchTournamentMatches(request, env);
         } else if (method === 'GET' && pathname === '/api/match_history') {
              responseFromRoute = await handleFetchMatchHistory(request, env);
         }
-        // Live Match State and WebSocket might be public view
+        // Live Match State and WebSocket might be public view (From File 1/2 - same logic)
         else if (method === 'GET' && pathname.match(/^\/api\/live-match\/[^/]+\/state$/)) {
              const doIdString = pathname.split('/')[3];
+             // Uses File 2 forwardRequestToDO
              responseFromRoute = await forwardRequestToDO(doIdString, env, request, '/state', 'GET');
         } else if (method === 'GET' && pathname.match(/^\/api\/live-match\/[^/]+\/websocket$/)) {
              const doIdString = pathname.split('/')[3];
              const doStub = getMatchDO(doIdString, env);
              const doUrl = new URL(request.url);
              doUrl.pathname = '/websocket';
-             // WebSocket forwarding needs direct response return, handled below
+             // WebSocket forwarding needs direct response return
              responseFromRoute = await doStub.fetch(doUrl.toString(), request);
         }
-        // Public GET for individual members (by ID)
+        // Public GET for individual members (by ID) (From File 1/2 - same)
         else if (method === 'GET' && pathname.match(/^\/api\/members\/\d+$/)) {
              responseFromRoute = await handleGetMemberById(request, env);
         }
-        // Public GET for members list (can filter by team_code)
+        // Public GET for members list (can filter by team_code) (From File 1/2 - same)
         else if (method === 'GET' && pathname === '/api/members') {
              responseFromRoute = await handleFetchMembers(request, env);
         }
 
 
         // --- Authenticated User API Endpoints (Require Kinde Auth) ---
-        // Use authMiddleware to protect these routes
+        // Use authMiddleware (From File 2) to protect these routes
         else if (method === 'GET' && pathname === '/api/members/me') {
+            // Get authenticated user's member info (Using File 2 authMiddleware, File 1 logic)
             responseFromRoute = await authMiddleware(request, env, ctx, handleFetchMe);
         } else if (method === 'POST' && pathname === '/api/teams/join') {
+            // Join team (Using File 2 authMiddleware, File 2 logic)
             responseFromRoute = await authMiddleware(request, env, ctx, handleJoinTeam);
         } else if (method === 'PATCH' && pathname.match(/^\/api\/members\/[^/]+$/)) { // Match /api/members/:maimaiId
+             // User update member (Using File 2 authMiddleware, File 2 logic)
              responseFromRoute = await authMiddleware(request, env, ctx, handleUserPatchMember);
         } else if (method === 'DELETE' && pathname.match(/^\/api\/members\/[^/]+$/)) { // Match /api/members/:maimaiId
+             // User delete member (Using File 2 authMiddleware, File 2 logic)
              responseFromRoute = await authMiddleware(request, env, ctx, handleUserDeleteMember);
         } else if (method === 'POST' && pathname === '/api/member_song_preferences') {
+             // Save member song preference (Using File 2 authMiddleware, File 1 logic and ON CONFLICT)
              responseFromRoute = await authMiddleware(request, env, ctx, handleSaveMemberSongPreference);
         } else if (method === 'GET' && pathname === '/api/member_song_preferences') {
+             // Fetch member song preferences (Using File 2 authMiddleware, File 1 logic and path)
+             // Note: File 1 uses query params ?member_id=...&stage=...
              responseFromRoute = await authMiddleware(request, env, ctx, handleFetchMemberSongPreferences);
         }
 
 
         // --- Admin API Endpoints (Require Admin Auth) ---
-        // Use adminAuthMiddleware to protect these routes
+        // Use adminAuthMiddleware (From File 2) to protect these routes
         else if (method === 'GET' && pathname === '/api/admin/members') {
+             // Admin fetch all members (Using File 2 adminAuthMiddleware, File 1 logic)
              responseFromRoute = await adminAuthMiddleware(request, env, ctx, handleAdminFetchMembers);
+        } else if (method === 'GET' && pathname.match(/^\/api\/admin\/members\/\d+$/)) { // Match /api/admin/members/:id (From File 2)
+             // Admin get member by ID (Using File 2 adminAuthMiddleware, File 2 logic)
+             const memberId = parseInt(pathname.split('/')[4], 10);
+             if (isNaN(memberId)) {
+                 responseFromRoute = errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
+             } else {
+                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminGetMemberById(req, env, ctx, userId, memberId));
+             }
+        } else if (method === 'PATCH' && pathname.match(/^\/api\/admin\/members\/\d+$/)) { // Match /api/admin/members/:id (From File 2)
+             // Admin patch member by ID (Using File 2 adminAuthMiddleware, File 2 logic)
+             const memberId = parseInt(pathname.split('/')[4], 10);
+             if (isNaN(memberId)) {
+                 responseFromRoute = errorResponse("Invalid member ID in path", 400); // Uses File 2 errorResponse
+             } else {
+                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminPatchMember(req, env, ctx, userId, memberId));
+             }
         }
-        // Tournament/Match Admin Actions
+        // Tournament/Match Admin Actions (Using File 2 adminAuthMiddleware, File 2 logic)
         else if (method === 'POST' && pathname === '/api/tournament_matches') {
              responseFromRoute = await adminAuthMiddleware(request, env, ctx, handleCreateTournamentMatch);
         }
-        else if (method === 'PUT' && pathname.match(/^\/api\/tournament_matches\/\d+\/confirm_setup$/)) {
+        else if (method === 'PUT' && pathname.match(/^\/api\/tournament_matches\/\d+\/confirm_setup$/)) { // Match /api/tournament_matches/:id/confirm_setup
              const tournamentMatchId = parseInt(pathname.split('/')[3], 10);
-             if (!isNaN(tournamentMatchId)) {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => handleConfirmMatchSetup(req, env, userId, tournamentMatchId));
-             } else { responseFromRoute = errorResponse("Invalid tournament match ID", 400); }
+             if (isNaN(tournamentMatchId)) {
+                 responseFromRoute = errorResponse("Invalid tournament match ID in path", 400); // Uses File 2 errorResponse
+             } else {
+                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleConfirmMatchSetup(req, env, ctx, userId, tournamentMatchId));
+             }
         }
-        else if (method === 'POST' && pathname.match(/^\/api\/tournament_matches\/\d+\/start_live$/)) {
+        else if (method === 'POST' && pathname.match(/^\/api\/tournament_matches\/\d+\/start_live$/)) { // Match /api/tournament_matches/:id/start_live
              const tournamentMatchId = parseInt(pathname.split('/')[3], 10);
-             if (!isNaN(tournamentMatchId)) {
-                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => handleStartLiveMatch(req, env, userId, tournamentMatchId));
-             } else { responseFromRoute = errorResponse("Invalid tournament match ID", 400); }
+             if (isNaN(tournamentMatchId)) {
+                 responseFromRoute = errorResponse("Invalid tournament match ID in path", 400); // Uses File 2 errorResponse
+             } else {
+                 responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleStartLiveMatch(req, env, ctx, userId, tournamentMatchId));
+             }
         }
-        // Live Match DO Actions (forwarded via Worker)
-        else if (pathname.match(/^\/api\/live-match\/[^/]+\/(calculate-round|next-round|archive|resolve-draw|select-tiebreaker-song)$/)) {
-             const parts = pathname.split('/');
-             const doIdString = parts[3];
-             const action = parts[4]; // e.g., "calculate-round"
-             // Map the URL action to the internal DO path
-             const internalPath = `/internal/${action}`; // Assumes internal paths match API paths with /internal/ prefix
-
-             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, context, userId) => {
-                 // Forward the request to the DO *after* admin auth
-                 // forwardRequestToDO will handle reading the body if needed
-                 return forwardRequestToDO(doIdString, env, req, internalPath, req.method);
-             });
+        // Live Match DO Actions (Admin Only) (Using File 2 adminAuthMiddleware, File 2 logic)
+        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/calculate-round$/)) { // Match /api/live-match/:doId/calculate-round
+             const doIdString = pathname.split('/')[3];
+             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminCalculateRound(req, env, ctx, userId, doIdString));
+        }
+        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/next-round$/)) { // Match /api/live-match/:doId/next-round
+             const doIdString = pathname.split('/')[3];
+             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminNextRound(req, env, ctx, userId, doIdString));
+        }
+        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/archive$/)) { // Match /api/live-match/:doId/archive
+             const doIdString = pathname.split('/')[3];
+             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminArchiveMatch(req, env, ctx, userId, doIdString));
+        }
+        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/resolve-draw$/)) { // Match /api/live-match/:doId/resolve-draw
+             const doIdString = pathname.split('/')[3];
+             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminResolveDraw(req, env, ctx, userId, doIdString));
+        }
+        else if (method === 'POST' && pathname.match(/^\/api\/live-match\/[^/]+\/select-tiebreaker-song$/)) { // Match /api/live-match/:doId/select-tiebreaker-song
+             const doIdString = pathname.split('/')[3];
+             responseFromRoute = await adminAuthMiddleware(request, env, ctx, (req, env, ctx, userId) => handleAdminSelectTiebreakerSong(req, env, ctx, userId, doIdString));
         }
 
 
-        // --- Fallback for unmatched routes ---
+        // --- Fallback for unmatched routes (From File 1) ---
         else {
-            responseFromRoute = new Response('Not Found.', { status: 404, headers: CORS_HEADERS }); // Add CORS headers to 404
+            responseFromRoute = errorResponse('Not Found', 404); // Uses File 2 errorResponse
         }
 
-        // --- Add CORS headers *UNLESS* it's a WebSocket upgrade response ---
-        // (Keep this logic as is)
-        if (responseFromRoute.webSocket) {
-            console.log("Worker: Returning WebSocket upgrade response directly.");
-            return responseFromRoute;
-        }
+        // For WebSocket responses, the DO fetch already returns the response directly.
+        // For other responses, add CORS headers if they aren't already present (jsonResponse/errorResponse add them).
+        // This final check is mostly redundant if all handlers use jsonResponse/errorResponse,
+        // but can be a safeguard. However, the handlers *do* use those helpers,
+        // and the DO fetch for WebSocket returns a raw response that shouldn't have CORS headers added here.
+        // Let's rely on the handlers/DO fetch to set headers correctly.
 
-        // If it's NOT a WebSocket upgrade, ensure CORS headers are present
-        // The jsonResponse and errorResponse helpers already add CORS_HEADERS,
-        // but this ensures it for any other response types (like the 404 above).
-        // We create a new Response to ensure headers are mutable if needed,
-        // although jsonResponse/errorResponse already return new Responses.
-        // This step might be redundant if all paths use jsonResponse/errorResponse or the WebSocket logic.
-        // Let's keep it simple and assume jsonResponse/errorResponse handle headers.
-        // The 404 case above was updated to add headers.
-
-        return responseFromRoute; // Return the response generated by the route logic (which includes CORS headers)
+        return responseFromRoute;
     },
 };
 
-// Make the Durable Object class available (Keep as is)
 export { MatchDO };
-
-// TODO: Implement other Admin Handlers (handleAdminAddMember, handleAdminPatchMember, handleAdminDeleteMember, handleAdminUpdateSettings)
-// These will need to accept kindeUserId from the middleware and perform actions based on admin privileges.
-// Example: handleAdminPatchMember might update any member's record, not just the authenticated user's.
-// They should also use env.R2_PUBLIC_BUCKET_URL for avatar URLs.

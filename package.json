@@ -17,6 +17,7 @@
 		"wrangler": "^4.18.0"
 	},
 	"dependencies": {
+		"@tsndr/cloudflare-worker-jwt": "^3.2.0",
 		"jose": "^6.0.11"
 	}
 }
