@@ -2401,7 +2401,6 @@ async function handleFetchUserMatchSelectionData(request: Request, env: Env, ctx
     }
 }
 
-
 // POST /api/member/match-selection/:matchId (Authenticated User)
 async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     const parts = new URL(request.url).pathname.split('/');
@@ -2424,6 +2423,19 @@ async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: E
             return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
         }
 
+        // --- 新增步骤：通过 member.team_code 查找用户队伍在 teams 表中的 ID ---
+        const userTeam = await env.DB.prepare('SELECT id FROM teams WHERE code = ? LIMIT 1')
+             .bind(member.team_code)
+             .first<{ id: number }>();
+
+        if (!userTeam) {
+             // This case indicates a data inconsistency (member has a team_code that doesn't exist in teams)
+             console.error(`Data inconsistency: Member ${member.id} has team_code ${member.team_code} but team not found.`);
+             return errorResponse("Could not find your team information.", 500);
+        }
+        const userTeamId = userTeam.id; // 获取用户队伍的数字 ID
+
+
         // 2. Fetch match details and determine user's team ID
         const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
         if (!match) {
@@ -2431,9 +2443,10 @@ async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: E
         }
 
         let myTeamId: number | undefined;
-        if (match.team1_id === member.team_code) { // Assuming team_code matches team.id
+        // 修正这里的比较逻辑：将 member.team_code 替换为 userTeamId
+        if (match.team1_id === userTeamId) {
              myTeamId = match.team1_id;
-        } else if (match.team2_id === member.team_code) { // Assuming team_code matches team.id
+        } else if (match.team2_id === userTeamId) {
              myTeamId = match.team2_id;
         } else {
              // User's team is not in this match
@@ -2514,7 +2527,7 @@ async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: E
             .bind(
                 matchId,
                 member.id,
-                myTeamId,
+                myTeamId, // 使用正确的 myTeamId (数字)
                 payload.song1_id,
                 payload.song1_difficulty,
                 payload.song2_id,
