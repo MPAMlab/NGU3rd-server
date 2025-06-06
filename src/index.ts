@@ -1953,10 +1953,11 @@ async function handleConfirmMatchSetup(request: Request, env: Env, ctx: Executio
 
 
 // GET /api/tournament_matches/:matchId/selection-status (Authenticated User - Changed from Public based on File 1 description needing team/member details)
-async function handleFetchMatchSelectionStatus(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+async function handleCheckMatchSelectionStatus(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     const parts = new URL(request.url).pathname.split('/');
-    const matchId = parseInt(parts[4], 10); // /api/tournament_matches/:matchId/selection-status -> parts[4]
-    console.log(`Authenticated user ${kindeUserId} handling /api/tournament_matches/${matchId}/selection-status GET request...`);
+    // Corrected: matchId is at index 3 for this path structure
+    const matchId = parseInt(parts[3], 10); // /api/tournament_matches/:matchId/selection-status -> parts[3]
+    console.log(`Handling GET /api/tournament_matches/${matchId}/selection-status for Admin user ID: ${kindeUserId}`);
 
     if (isNaN(matchId)) {
         return errorResponse("Invalid match ID in path", 400);
@@ -2025,8 +2026,8 @@ async function handleFetchMatchSelectionStatus(request: Request, env: Env, ctx: 
         return jsonResponse(responseData);
 
     } catch (e: any) {
-        console.error(`Worker: Failed to get match selection status for match ${matchId}:`, e);
-        return errorResponse(e.message);
+        console.error("Error checking match selection status:", e);
+        return errorResponse('Failed to check match selection status.', 500, e);
     }
 }
 
@@ -2034,8 +2035,9 @@ async function handleFetchMatchSelectionStatus(request: Request, env: Env, ctx: 
 // POST /api/tournament_matches/:matchId/compile-setup (Admin Only)
 async function handleCompileMatchSetup(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
     const parts = new URL(request.url).pathname.split('/');
-    const matchId = parseInt(parts[4], 10); // /api/tournament_matches/:matchId/compile-setup -> parts[4]
-    console.log(`Admin user ${kindeUserId} handling /api/tournament_matches/${matchId}/compile-setup POST request...`);
+    // Corrected: matchId is at index 3 for this path structure
+    const matchId = parseInt(parts[3], 10); // /api/tournament_matches/:matchId/compile-setup -> parts[3]
+    console.log(`Handling POST /api/tournament_matches/${matchId}/compile-setup for Admin user ID: ${kindeUserId}`);
 
     if (isNaN(matchId)) {
         return errorResponse("Invalid match ID in path", 400);
@@ -2301,7 +2303,7 @@ async function handleFetchUserMatchSelectionData(request: Request, env: Env, ctx
     }
 
     try {
-        // 1. Find the member ID for the authenticated Kinde user
+        // 1. Find the member ID and team code for the authenticated Kinde user
         const member = await env.DB.prepare('SELECT id, team_code FROM members WHERE kinde_user_id = ? LIMIT 1')
             .bind(kindeUserId)
             .first<{ id: number; team_code: string }>();
@@ -2310,19 +2312,32 @@ async function handleFetchUserMatchSelectionData(request: Request, env: Env, ctx
             return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
         }
 
+        // --- 新增步骤：通过 member.team_code 查找用户队伍在 teams 表中的 ID ---
+        const userTeam = await env.DB.prepare('SELECT id FROM teams WHERE code = ? LIMIT 1')
+             .bind(member.team_code)
+             .first<{ id: number }>();
+
+        if (!userTeam) {
+             // This case indicates a data inconsistency (member has a team_code that doesn't exist in teams)
+             console.error(`Data inconsistency: Member ${member.id} has team_code ${member.team_code} but team not found.`);
+             return errorResponse("Could not find your team information.", 500);
+        }
+        const userTeamId = userTeam.id; // 获取用户队伍的数字 ID
+
         // 2. Fetch match details
         const match = await env.DB.prepare('SELECT id, team1_id, team2_id, status FROM tournament_matches WHERE id = ?').bind(matchId).first<TournamentMatch>();
         if (!match) {
             return errorResponse('Match not found.', 404);
         }
 
-        // 3. Determine user's team and opponent team IDs
+        // 3. Determine user's team and opponent team IDs (使用用户队伍的数字 ID 进行比较)
         let myTeamId: number | undefined;
         let opponentTeamId: number | undefined;
-        if (match.team1_id === member.team_code) { // Assuming team_code matches team.id for simplicity based on schema
+        // 修正这里的比较逻辑：将 member.team_code 替换为 userTeamId
+        if (match.team1_id === userTeamId) {
              myTeamId = match.team1_id;
              opponentTeamId = match.team2_id;
-        } else if (match.team2_id === member.team_code) { // Assuming team_code matches team.id
+        } else if (match.team2_id === userTeamId) {
              myTeamId = match.team2_id;
              opponentTeamId = match.team1_id;
         } else {
@@ -2331,6 +2346,9 @@ async function handleFetchUserMatchSelectionData(request: Request, env: Env, ctx
         }
 
         // 4. Fetch teams, members, user's selection, and all selections for occupied indices
+        // 注意：这里查询 members 仍然需要使用 team_code，因为 members 表是以外键 team_code 关联 teams 表的
+        // 或者，如果你在 members 表中也存了 team_id，那会更直接。
+        // 假设 members 表只有 team_code，需要通过 team_id 查 teams 表获取 code
         const [myTeamResult, opponentTeamResult, myTeamMembersResult, opponentTeamMembersResult, mySelectionResult, allSelectionsResult] = await env.DB.batch([
             env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(myTeamId),
             env.DB.prepare('SELECT id, name FROM teams WHERE id = ? LIMIT 1').bind(opponentTeamId),
@@ -2579,7 +2597,7 @@ async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
 
 
         let countQuery = "SELECT COUNT(*) as count FROM songs";
-        let dataQuery = "SELECT id, title, artist, genre, bpm, release_date, version, cover_filename, levels_json FROM songs";
+        let dataQuery = "SELECT id, title, category, bpm, levels_json, type, cover_filename, source_data_version, created_at FROM songs";
 
         if (whereClauses.length > 0) {
             countQuery += " WHERE " + whereClauses.join(" AND ");
@@ -2606,9 +2624,22 @@ async function handleFetchSongs(request: Request, env: Env): Promise<Response> {
             const fullCoverUrl = song.cover_filename && env.R2_PUBLIC_BUCKET_URL
                 ? `${env.R2_PUBLIC_BUCKET_URL}/${song.cover_filename}`
                 : undefined;
-            const { levels_json, ...rest } = song; // Remove raw JSON field
-            return { ...rest, parsedLevels, fullCoverUrl };
+            // 只包含 Schema 中实际存在的列
+            return {
+                id: song.id,
+                title: song.title,
+                category: song.category, // 包含 category
+                bpm: song.bpm,
+                type: song.type, // 包含 type  
+                cover_filename: song.cover_filename,
+                source_data_version: song.source_data_version, // 包含 source_data_version
+                created_at: song.created_at, // 包含 created_at
+                parsedLevels: parsedLevels,
+                fullCoverUrl: fullCoverUrl,
+                // artist, genre, version (如果不是 source_data_version) 不存在，不包含
+            };
         });
+        
 
         // Apply level/difficulty filter in worker if needed (less efficient for large datasets)
         let filteredSongs = processedSongs;
@@ -2825,7 +2856,6 @@ async function handleGetMatchHistory(request: Request, env: Env): Promise<Respon
     return forwardRequestToDO(matchId, env, request, '/history', 'GET');
 }
 
-
 // --- Main Worker Fetch Handler ---
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -2867,8 +2897,22 @@ export default {
             // Can include ?team_code=...
             return handleFetchMembers(request, env);
         }
+
+        // --- Authenticated User Routes (Require authMiddleware) ---
+        // 将 /api/members/me 放在 /api/members/:id 之前检查
+        if (path === '/api/members/me' && method === 'GET') {
+            // This route requires authentication
+            return authMiddleware(request, env, ctx, handleFetchMe);
+        }
+
+        // --- Public Routes (Continued) ---
+        // Add the missing route for fetching tournament matches
+        if (path === '/api/tournament_matches' && method === 'GET') {
+            return handleFetchTournamentMatches(request, env);
+        }
+        // Now check for /api/members/:id *after* checking for /api/members/me
         if (path.startsWith('/api/members/') && path.split('/').length === 4 && method === 'GET') {
-             // Matches /api/members/:id
+             // Matches /api/members/:id (Public route to get member by ID)
              return handleGetMemberById(request, env);
         }
         if (path === '/api/songs' && method === 'GET') {
@@ -2881,19 +2925,16 @@ export default {
         // Public Match DO routes
         if (path.startsWith('/api/matches/') && path.endsWith('/state') && path.split('/').length === 5 && method === 'GET') {
              // Matches /api/matches/:matchId/state
-             return handleGetMatchState(request, env);
+             return forwardRequestToDO(path.split('/')[3], env, request, '/state', 'GET');
         }
         if (path.startsWith('/api/matches/') && path.endsWith('/history') && path.split('/').length === 5 && method === 'GET') {
              // Matches /api/matches/:matchId/history
-             return handleGetMatchHistory(request, env);
+             return forwardRequestToDO(path.split('/')[3], env, request, '/history', 'GET');
         }
 
 
-        // --- Authenticated User Routes (Require authMiddleware) ---
-        // Use authMiddleware to protect these routes
-        if (path === '/api/members/me' && method === 'GET') {
-            return authMiddleware(request, env, ctx, handleFetchMe);
-        }
+        // --- Authenticated User Routes (Continued - Require authMiddleware) ---
+        // Other authenticated routes remain here
         if (path === '/api/teams/join' && method === 'POST') {
             return authMiddleware(request, env, ctx, handleJoinTeam);
         }
@@ -2927,7 +2968,7 @@ export default {
         // Making it authenticated for now, as it reveals team/member selection status.
         if (path.startsWith('/api/tournament_matches/') && path.endsWith('/selection-status') && path.split('/').length === 5 && method === 'GET') {
              // Matches /api/tournament_matches/:matchId/selection-status
-             return authMiddleware(request, env, ctx, handleFetchMatchSelectionStatus);
+             return adminAuthMiddleware(request, env, ctx, handleCheckMatchSelectionStatus);
         }
 
 
