@@ -977,6 +977,72 @@ async function handleJoinTeam(request: Request, env: Env, ctx: ExecutionContext,
     }
 }
 
+// GET /api/member/matches (Authenticated User)
+async function handleFetchUserMatches(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
+    console.log(`Authenticated user ${kindeUserId} handling /api/member/matches GET request...`);
+
+    try {
+        // 1. Find the member ID and team code for the authenticated Kinde user
+        const member = await env.DB.prepare('SELECT id, team_code FROM members WHERE kinde_user_id = ? LIMIT 1')
+            .bind(kindeUserId)
+            .first<{ id: number; team_code: string }>();
+
+        if (!member) {
+            return errorResponse("Authenticated user is not registered as a member.", 403); // Forbidden
+        }
+
+        // 2. Find the user's team ID from the team_code
+        const userTeam = await env.DB.prepare('SELECT id FROM teams WHERE code = ? LIMIT 1')
+             .bind(member.team_code)
+             .first<{ id: number }>();
+
+        if (!userTeam) {
+             // This case indicates a data inconsistency
+             console.error(`Data inconsistency: Member ${member.id} has team_code ${member.team_code} but team not found.`);
+             return errorResponse("Could not find your team information.", 500);
+        }
+        const userTeamId = userTeam.id; // 获取用户队伍的数字 ID
+
+        // 3. Fetch all matches where the user's team is either team1 or team2
+        // Include team names for display
+        const query = `
+            SELECT
+                tm.*,
+                t1.name AS team1_name,
+                t2.name AS team2_name,
+                tw.name AS winner_team_name
+            FROM tournament_matches tm
+            JOIN teams t1 ON tm.team1_id = t1.id
+            JOIN teams t2 ON tm.team2_id = t2.id
+            LEFT JOIN teams tw ON tm.winner_team_id = tw.id
+            WHERE tm.team1_id = ? OR tm.team2_id = ?
+            ORDER BY tm.scheduled_time DESC, tm.created_at DESC -- Order by scheduled time (upcoming first) or creation time
+        `;
+
+        const { results } = await env.DB.prepare(query).bind(userTeamId, userTeamId).all<TournamentMatch>();
+
+        // Parse JSON fields and add fullCoverUrl for match_song_list (optional, might not be needed for this list view)
+        // Let's skip parsing JSON here for simplicity in the list view,
+        // as the detailed song list is needed on the selection page.
+        // If you need player orders or song lists in this view, add parsing here.
+        const matchesWithTeamNames = results.map(match => {
+             const parsedMatch = { ...match } as TournamentMatch;
+             // Remove raw JSON fields if not needed in this list view
+             delete (parsedMatch as any).team1_player_order_json;
+             delete (parsedMatch as any).team2_player_order_json;
+             delete (parsedMatch as any).match_song_list_json;
+             return parsedMatch;
+        });
+
+
+        return jsonResponse(matchesWithTeamNames);
+
+    } catch (e: any) {
+        console.error(`Worker: Failed to fetch user's matches for user ${kindeUserId}:`, e);
+        return errorResponse(e.message);
+    }
+}
+
 // PATCH /api/members/:maimaiId (Authenticated User)
 async function handleUserPatchMember(request: Request, env: Env, ctx: ExecutionContext, kindeUserId: string): Promise<Response> {
      console.log(`Handling /api/members/:maimaiId PATCH request for Kinde user ID: ${kindeUserId}`);
@@ -2982,6 +3048,9 @@ export default {
         if (path.startsWith('/api/tournament_matches/') && path.endsWith('/selection-status') && path.split('/').length === 5 && method === 'GET') {
              // Matches /api/tournament_matches/:matchId/selection-status
              return adminAuthMiddleware(request, env, ctx, handleCheckMatchSelectionStatus);
+        }
+        if (path === '/api/member/matches' && method === 'GET') {
+            return authMiddleware(request, env, ctx, handleFetchUserMatches);
         }
 
 
