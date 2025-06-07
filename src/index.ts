@@ -3,7 +3,7 @@
 // --- Imports ---
 // Import @tsndr/cloudflare-worker-jwt for Kinde Auth
 import jwt from '@tsndr/cloudflare-worker-jwt';
-
+import { calculateSemifinalScore } from './utils/semifinalScoreCalculator';
 // Import your backend types (Ensure this file exists and contains necessary types)
 import type {
     Env,
@@ -36,7 +36,9 @@ import type {
     CompileMatchSetupResponse, // Corrected type name
     // Add missing payloads used in existing handlers
     CreateTournamentMatchPayload, // Used in handleCreateTournamentMatch
-    ConfirmMatchSetupPayload // Used in handleConfirmMatchSetup
+    ConfirmMatchSetupPayload, // Used in handleConfirmMatchSetup
+    SemifinalMatch, // <-- Import new types
+
 } from './types'; // Adjust path to your types file
 
 import { MatchDO } from './durable-objects/matchDo'; // Adjust path to your DO file
@@ -2773,6 +2775,292 @@ async function handleSaveMatchPlayerSelection(request: Request, env: Env, ctx: E
     }
 }
 
+// POST /api/semifinal-matches (Admin)
+async function handleCreateSemifinalMatch(request: Request, env: Env): Promise<Response> {
+    // Admin middleware is applied by the router
+    const payload: CreateSemifinalMatchPayload = await request.json();
+    console.log("Received create semifinal match payload:", payload);
+
+    if (!payload.round_name || !payload.player1_id || !payload.player2_id) {
+        return errorResponse('Missing round_name, player1_id, or player2_id', 400);
+    }
+    if (payload.player1_id === payload.player2_id) {
+        return errorResponse('Player A and Player B cannot be the same player', 400);
+    }
+
+    try {
+        const result = await env.DB.prepare(
+            'INSERT INTO semifinal_matches (round_name, player1_id, player2_id, scheduled_time, status) VALUES (?, ?, ?, ?, ?)'
+        )
+        .bind(
+            payload.round_name,
+            payload.player1_id,
+            payload.player2_id,
+            payload.scheduled_time,
+            'scheduled' // Initial status
+        )
+        .run();
+
+        if (!result.success) {
+            console.error("DB insert failed:", result.error);
+            return errorResponse('Failed to create semifinal match', 500, result.error);
+        }
+
+        // Optionally fetch and return the created match
+        // const newMatch = await env.DB.prepare('SELECT * FROM semifinal_matches WHERE rowid = last_insert_rowid()').first<SemifinalMatch>();
+        // return jsonResponse(newMatch, 201);
+
+        return jsonResponse({ message: 'Semifinal match created successfully' }, 201);
+
+    } catch (e: any) {
+        console.error("Error creating semifinal match:", e);
+        return errorResponse('Internal server error creating match', 500, e.message);
+    }
+}
+
+// GET /api/semifinal_matches (Admin)
+async function handleFetchSemifinalMatches(request: Request, env: Env): Promise<Response> {
+    // Admin middleware is applied by the router
+    try {
+        // Fetch semifinal matches, joining members for nicknames
+        const query = `
+            SELECT
+                sm.*,
+                p1.nickname AS player1_nickname,
+                p2.nickname AS player2_nickname,
+                w_p.nickname AS winner_player_nickname
+            FROM semifinal_matches sm
+            LEFT JOIN members p1 ON sm.player1_id = p1.id
+            LEFT JOIN members p2 ON sm.player2_id = p2.id
+            LEFT JOIN members w_p ON sm.winner_player_id = w_p.id
+            ORDER BY sm.scheduled_time ASC, sm.id ASC
+        `;
+        const { results } = await env.DB.prepare(query).all<SemifinalMatch>();
+
+        // Manually parse JSON fields for each result
+        const processedResults = results.map(match => {
+            const processedMatch = { ...match } as SemifinalMatch;
+            if (match.results_json) {
+                try { processedMatch.results = JSON.parse(match.results_json); } catch (e) { console.error("Failed to parse results_json", e); }
+            }
+            return processedMatch;
+        });
+
+
+        return jsonResponse(processedResults);
+    } catch (e: any) {
+        console.error("Error fetching semifinal matches:", e);
+        return errorResponse('Failed to fetch semifinal matches', 500, e.message);
+    }
+}
+
+// POST /api/semifinal-matches/:id/submit-scores (Admin)
+async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: number): Promise<Response> {
+    // Admin middleware is applied by the router
+    const payload: SubmitSemifinalScoresPayload = await request.json();
+    console.log(`Received semifinal scores for match ${matchId}:`, payload);
+
+    if (!payload.player1 || !payload.player2 || !payload.player1.profession || !payload.player2.profession || payload.player1.percentage === undefined || payload.player2.percentage === undefined) {
+        return errorResponse('Invalid payload: missing player data, profession, or percentage', 400);
+    }
+
+    try {
+        // Fetch the match to ensure it exists and is in the correct status ('scheduled')
+        const match = await env.DB.prepare('SELECT * FROM semifinal_matches WHERE id = ?').bind(matchId).first<SemifinalMatch>();
+
+        if (!match) {
+            return errorResponse('Semifinal match not found', 404);
+        }
+
+        if (match.status !== 'scheduled') {
+             // Allow resubmission if needed, but for simplicity, let's only allow 'scheduled'
+             return errorResponse(`Match is not in 'scheduled' status (current status: ${match.status})`, 400);
+        }
+
+        // Ensure the player IDs in the payload match the match record
+        if (match.player1_id !== payload.player1.id || match.player2_id !== payload.player2.id) {
+             console.warn(`Player IDs in payload did not match DB for match ${matchId}. Using IDs from match record.`);
+             payload.player1.id = match.player1_id; // Use ID from DB
+             payload.player2.id = match.player2_id; // Use ID from DB
+        }
+
+        // Fetch player nicknames for calculation logs
+        const players = await env.DB.prepare('SELECT id, nickname FROM members WHERE id IN (?, ?)').bind(payload.player1.id, payload.player2.id).all<{ id: number; nickname: string }>();
+        const player1Nickname = players.results.find(p => p.id === payload.player1.id)?.nickname || `Player ${payload.player1.id}`;
+        const player2Nickname = players.results.find(p => p.id === payload.player2.id)?.nickname || `Player ${payload.player2.id}`;
+
+
+        // Prepare data for calculation
+        const player1Data: PlayerCalculationData = {
+            id: payload.player1.id,
+            nickname: player1Nickname,
+            profession: payload.player1.profession,
+            percentage: payload.player1.percentage
+        };
+        const player2Data: PlayerCalculationData = {
+            id: payload.player2.id,
+            nickname: player2Nickname,
+            profession: payload.player2.profession,
+            percentage: payload.player2.percentage
+        };
+
+        // Perform calculation
+        const result1 = calculateSemifinalScore(player1Data, player2Data);
+        const result2 = calculateSemifinalScore(player2Data, player1Data);
+
+        // Determine winner
+        let winnerPlayerId: number | null = null;
+        if (result1.totalScore > result2.totalScore) {
+            winnerPlayerId = result1.id;
+        } else if (result2.totalScore > result1.totalScore) {
+            winnerPlayerId = result2.id;
+        } else {
+            // Handle draw - Player 1 wins on tie for simplicity
+             winnerPlayerId = result1.id;
+             console.warn(`Semifinal match ${matchId} resulted in a draw (${result1.totalScore.toFixed(4)} vs ${result2.totalScore.toFixed(4)}). Player 1 (${player1Nickname}) wins tiebreak.`);
+        }
+
+
+        // Store results in the database
+        const semifinalResults = {
+            player1: result1,
+            player2: result2,
+            submitted_at: new Date().toISOString()
+        };
+
+        const updateResult = await env.DB.prepare(
+            `UPDATE semifinal_matches
+             SET status = ?, winner_player_id = ?,
+                 player1_percentage = ?, player2_percentage = ?,
+                 player1_profession = ?, player2_profession = ?,
+                 final_score_player1 = ?, final_score_player2 = ?,
+                 results_json = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+        )
+        .bind(
+            'completed', // Mark as completed
+            winnerPlayerId,
+            payload.player1.percentage,
+            payload.player2.percentage,
+            payload.player1.profession,
+            payload.player2.profession,
+            result1.totalScore,
+            result2.totalScore,
+            JSON.stringify(semifinalResults), // Store results as JSON
+            matchId
+        )
+        .run();
+
+        if (!updateResult.success) {
+            console.error("DB update failed:", updateResult.error);
+            return errorResponse('Failed to save match results', 500, updateResult.error);
+        }
+
+        // Fetch the updated match to return
+        const updatedMatch = await env.DB.prepare(
+             `SELECT
+                sm.*,
+                p1.nickname AS player1_nickname,
+                p2.nickname AS player2_nickname,
+                w_p.nickname AS winner_player_nickname
+            FROM semifinal_matches sm
+            LEFT JOIN members p1 ON sm.player1_id = p1.id
+            LEFT JOIN members p2 ON sm.player2_id = p2.id
+            LEFT JOIN members w_p ON sm.winner_player_id = w_p.id
+            WHERE sm.id = ?`
+        ).bind(matchId).first<SemifinalMatch>();
+
+         // Manually parse JSON fields for the updated match
+         if (updatedMatch && updatedMatch.results_json) {
+             try { updatedMatch.results = JSON.parse(updatedMatch.results_json); } catch (e) { console.error("Failed to parse results_json for updated match", matchId, e); }
+         }
+
+
+        return jsonResponse<SubmitSemifinalScoresResponse>({
+            success: true,
+            message: 'Scores submitted and results calculated successfully',
+            semifinalMatch: updatedMatch || undefined // Return updated match data
+        });
+
+    } catch (e: any) {
+        console.error("Error submitting semifinal scores:", e);
+        return errorResponse('Internal server error submitting scores', 500, e.message);
+    }
+}
+
+// GET /api/semifinal-matches/:id (Public view of completed match)
+async function handleFetchSemifinalMatch(request: Request, env: Env, matchId: number): Promise<Response> {
+     // This endpoint is public
+     try {
+         const match = await env.DB.prepare(
+             `SELECT
+                sm.*,
+                p1.nickname AS player1_nickname,
+                p2.nickname AS player2_nickname,
+                w_p.nickname AS winner_player_nickname
+            FROM semifinal_matches sm
+            LEFT JOIN members p1 ON sm.player1_id = p1.id
+            LEFT JOIN members p2 ON sm.player2_id = p2.id
+            LEFT JOIN members w_p ON sm.winner_player_id = w_p.id
+            WHERE sm.id = ?`
+         ).bind(matchId).first<SemifinalMatch>();
+
+         if (!match) {
+             return errorResponse('Semifinal match not found', 404);
+         }
+
+         // Parse the results JSON
+         if (match.results_json) {
+             try {
+                 match.results = JSON.parse(match.results_json);
+             } catch (e) {
+                 console.error("Failed to parse results_json for match", matchId, e);
+             }
+         }
+
+         // Remove results_json before sending to frontend if you prefer
+         // delete match.results_json; // Or handle this in the frontend type/parsing
+
+         return jsonResponse(match);
+
+     } catch (e: any) {
+         console.error(`Error fetching semifinal match ${matchId}:`, e);
+         return errorResponse('Failed to fetch semifinal match data', 500, e.message);
+     }
+}
+
+// POST /api/semifinal-matches/:id/archive (Admin)
+async function handleArchiveSemifinalMatch(request: Request, env: Env, matchId: number): Promise<Response> {
+     // Admin middleware is applied by the router
+     try {
+         const updateResult = await env.DB.prepare(
+             'UPDATE semifinal_matches SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+         )
+         .bind('archived', matchId)
+         .run();
+
+         if (!updateResult.success) {
+             console.error("DB update failed:", updateResult.error);
+             return errorResponse('Failed to archive match', 500, updateResult.error);
+         }
+
+         if (updateResult.meta.changes === 0) {
+              // Check if the match existed
+              const match = await env.DB.prepare('SELECT id FROM semifinal_matches WHERE id = ?').bind(matchId).first();
+              if (!match) {
+                   return errorResponse('Semifinal match not found', 404);
+              }
+              // If match existed but changes was 0, it might already be archived
+              return jsonResponse({ message: 'Match already archived' });
+         }
+
+         return jsonResponse({ message: 'Match archived successfully' });
+
+     } catch (e: any) {
+         console.error(`Error archiving semifinal match ${matchId}:`, e);
+         return errorResponse('Internal server error archiving match', 500, e.message);
+     }
+}
 
 // --- Songs API Handlers ---
 // GET /api/songs (Public, Paginated, Filterable)
@@ -3454,6 +3742,38 @@ export default {
              // Matches /api/tournament_matches/:matchId/start_live
              return adminAuthMiddleware(request, env, ctx, handleStartLiveMatch);
         }
+        // NEW Semifinal Match Endpoints
+        // POST /api/semifinal-matches (Admin)
+        if (path === '/api/semifinal-matches' && method === 'POST') {
+            // Admin middleware already applied above
+            return handleCreateSemifinalMatch(request, env);
+        }
+        // GET /api/semifinal-matches (Admin)
+        if (path === '/api/semifinal-matches' && method === 'GET') {
+                // Admin middleware already applied above
+                return handleFetchSemifinalMatches(request, env);
+        }
+        // POST /api/semifinal-matches/:id/submit-scores (Admin)
+        if (path.match(/^\/api\/semifinal-matches\/\d+\/submit-scores$/) && method === 'POST') {
+            const matchId = parseInt(path.split('/')[3]);
+            if (isNaN(matchId)) return errorResponse('Invalid matchId', 400);
+                // Admin middleware already applied above
+            return handleSubmitSemifinalScores(request, env, matchId);
+        }
+        // GET /api/semifinal-matches/:id (Public view of completed match)
+        if (path.match(/^\/api\/semifinal-matches\/\d+$/) && method === 'GET') {
+            const matchId = parseInt(path.split('/')[3]);
+            if (isNaN(matchId)) return errorResponse('Invalid matchId', 400);
+            // This endpoint is public
+            return handleFetchSemifinalMatch(request, env, matchId);
+        }
+            // POST /api/semifinal-matches/:id/archive (Admin)
+            if (path.match(/^\/api\/semifinal-matches\/\d+\/archive$/) && method === 'POST') {
+                const matchId = parseInt(path.split('/')[3]);
+                if (isNaN(matchId)) return errorResponse('Invalid matchId', 400);
+                // Admin middleware already applied above
+                return handleArchiveSemifinalMatch(request, env, matchId);
+            }
 
 
         // --- Not Found ---

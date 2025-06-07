@@ -442,3 +442,85 @@ export interface CompileMatchSetupResponse { // Renamed to match frontend expect
     message: string;
     tournamentMatch?: TournamentMatch; // Optional: return the updated match
 }
+
+// --- NEW TYPES FOR SEMIFINAL MATCHES (Backend) ---
+
+// Player data used for calculation (Backend)
+export interface PlayerCalculationData {
+    id: number;
+    nickname: string;
+    profession: Profession; // Use the Profession type defined below
+    percentage: number; // 乐曲完成率，如99.9876
+  }
+  
+  // Semifinal Score Calculation Result (Backend)
+  export interface SemifinalScoreResult {
+    id: number;
+    nickname: string;
+    profession: Profession;
+    originalScore: number; // 原始得分（小数点后四位）
+    bonusScore: number; // 职业技能加成
+    totalScore: number; // 最终得分
+    log: string[]; // 计分日志
+  }
+  
+  // Player Profession Type (Backend)
+  export type Profession = '矩盾手' | '炼星师' | '绝剑士';
+  
+  
+  // Semifinal Match Table Structure (Backend)
+  export interface SemifinalMatch {
+      id: number;
+      round_name: string;
+      player1_id: number; // FK to members.id
+      player2_id: number; // FK to members.id
+      status: 'scheduled' | 'completed' | 'archived'; // Status of the semifinal match
+      scheduled_time?: string | null; // Optional: ISO 8601 string
+      winner_player_id?: number | null; // NULLABLE, FK to members.id
+      player1_percentage?: number | null; // NULLABLE until submitted
+      player2_percentage?: number | null; // NULLABLE until submitted
+      player1_profession?: Profession | null; // NULLABLE until submitted
+      player2_profession?: Profession | null; // NULLABLE until submitted
+      final_score_player1?: number | null; // NULLABLE until calculated
+      final_score_player2?: number | null; // NULLABLE until calculated
+      results_json?: string | null; // JSON blob of { player1: SemifinalScoreResult, player2: SemifinalScoreResult }
+      created_at: string;
+      updated_at?: string;
+      player1_nickname?: string;
+      player2_nickname?: string;
+      winner_player_nickname?: string;
+      results?: { // Parsed results_json
+          player1: SemifinalScoreResult;
+          player2: SemifinalScoreResult;
+      } | null;
+  }
+  
+  // Payload for creating a new Semifinal Match (POST /api/semifinal-matches)
+  export interface CreateSemifinalMatchPayload {
+      round_name: string;
+      player1_id: number;
+      player2_id: number;
+      scheduled_time?: string | null;
+  }
+  
+  // Payload for submitting Semifinal Scores (POST /api/semifinal-matches/:id/submit-scores)
+  export interface SubmitSemifinalScoresPayload {
+      player1: {
+          id: number;
+          profession: Profession;
+          percentage: number;
+      };
+      player2: {
+          id: number;
+          profession: Profession;
+          percentage: number;
+      };
+  }
+  
+  // Response from submitting Semifinal Scores (Backend to Frontend)
+  export interface SubmitSemifinalScoresResponse {
+      success: boolean;
+      message: string;
+      semifinalMatch?: SemifinalMatch; // Return the updated match data
+  }
+  
