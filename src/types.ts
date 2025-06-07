@@ -371,6 +371,8 @@ export interface SongsApiResponseData {
 export interface SongFiltersApiResponseData {
     categories: string[];
     types: string[];
+    levels: string[]; // <-- ADDED
+    difficulties: string[]; // <-- ADDED
 }
 
 // Represents a player's song selections and order for a specific match (matches the DB table)
@@ -408,8 +410,10 @@ export interface FetchUserMatchSelectionData { // Renamed to match frontend expe
     mySelection: MatchPlayerSelection | null; // User's existing selection
     // Occupied indices need member_id and nickname for frontend display
     occupiedOrderIndices: { team_id: number; selected_order_index: number; member_id: number; member_nickname?: string }[];
-    availableOrderSlotsCount: number; // Total number of slots available per team (e.g., 3 for 3v3)
-    // Note: allSongs is NOT included here, frontend fetches it separately
+    availableOrderSlotsCount: number; // Total number of slots available per team (e.g., 3v3 is 3)
+    // ADDED: Include details for the selected songs if mySelection exists
+    song1Details?: Song | null; // Full Song object for song1
+    song2Details?: Song | null; // Full Song object for song2
 }
 
 // Response data for checking selection status (GET /api/tournament_matches/:matchId/selection-status)
