@@ -2853,15 +2853,19 @@ async function handleFetchSemifinalMatches(request: Request, env: Env): Promise<
         return errorResponse('Failed to fetch semifinal matches', 500, e.message);
     }
 }
-
 // POST /api/semifinal-matches/:id/submit-scores (Admin)
+// Assuming necessary types (Env, SubmitSemifinalScoresPayload, SemifinalMatch,
+// PlayerCalculationData, SemifinalScoreResult, Profession, jsonResponse, errorResponse)
+// are imported from your shared types file or defined appropriately.
+
 async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: number): Promise<Response> {
     // Admin middleware is applied by the router
     const payload: SubmitSemifinalScoresPayload = await request.json();
-    console.log(`Received semifinal scores for match ${matchId}:`, payload);
+    console.log(`Received semifinal scores payload for match ${matchId}:`, payload);
 
-    if (!payload.player1 || !payload.player2 || !payload.player1.profession || !payload.player2.profession || payload.player1.percentage === undefined || payload.player2.percentage === undefined) {
-        return errorResponse('Invalid payload: missing player data, profession, or percentage', 400);
+    // Basic payload validation: check for player objects and percentages
+    if (!payload.player1 || !payload.player2 || payload.player1.percentage === undefined || payload.player2.percentage === undefined) {
+        return errorResponse('Invalid payload: missing player data or percentage', 400);
     }
 
     try {
@@ -2872,41 +2876,80 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
             return errorResponse('Semifinal match not found', 404);
         }
 
-        if (match.status !== 'scheduled') {
-             // Allow resubmission if needed, but for simplicity, let's only allow 'scheduled'
-             return errorResponse(`Match is not in 'scheduled' status (current status: ${match.status})`, 400);
+        // Allow resubmission if status is 'scheduled' or 'completed' (in case of error)
+        // If you only want to allow submission once, keep it 'scheduled'
+        if (match.status !== 'scheduled' && match.status !== 'completed') {
+             return errorResponse(`Match is not in a calculable status (current status: ${match.status})`, 400);
         }
 
         // Ensure the player IDs in the payload match the match record
-        if (match.player1_id !== payload.player1.id || match.player2_id !== payload.player2.id) {
-             console.warn(`Player IDs in payload did not match DB for match ${matchId}. Using IDs from match record.`);
-             payload.player1.id = match.player1_id; // Use ID from DB
-             payload.player2.id = match.player2_id; // Use ID from DB
+        // This is a safety check, but we'll use IDs from the match record for DB queries
+        const player1Id = match.player1_id;
+        const player2Id = match.player2_id;
+
+        // Fetch player details (nickname and profession) from the members table
+        // MODIFICATION: Include 'job' in the SELECT query
+        const players = await env.DB.prepare('SELECT id, nickname, job FROM members WHERE id IN (?, ?)').bind(player1Id, player2Id).all<{ id: number; nickname: string; job: string | null }>();
+
+        const player1Member = players.results.find(p => p.id === player1Id);
+        const player2Member = players.results.find(p => p.id === player2Id);
+
+        // Check if players were found and have professions
+        if (!player1Member || !player2Member) {
+             console.error(`Could not find one or both players in DB for match ${matchId}. Player IDs: ${player1Id}, ${player2Id}`);
+             return errorResponse('Could not find one or both players in the database.', 404);
         }
 
-        // Fetch player nicknames for calculation logs
-        const players = await env.DB.prepare('SELECT id, nickname FROM members WHERE id IN (?, ?)').bind(payload.player1.id, payload.player2.id).all<{ id: number; nickname: string }>();
-        const player1Nickname = players.results.find(p => p.id === payload.player1.id)?.nickname || `Player ${payload.player1.id}`;
-        const player2Nickname = players.results.find(p => p.id === payload.player2.id)?.nickname || `Player ${payload.player2.id}`;
+        // MODIFICATION: Use the 'job' from the database as the profession
+        const player1Profession = player1Member.job as Profession | null;
+        const player2Profession = player2Member.job as Profession | null;
+
+        // Ensure professions are valid before calculation
+        // Assuming Profession type covers all valid job strings or null
+        if (!player1Profession || !player2Profession || !['矩盾手', '炼星师', '绝剑士'].includes(player1Profession) || !['矩盾手', '炼星师', '绝剑士'].includes(player2Profession)) {
+             console.error(`Invalid or missing profession from DB for match ${matchId}. P1: ${player1Member.job}, P2: ${player2Member.job}`);
+             return errorResponse(`Player profession not found or invalid for ${player1Member.nickname} or ${player2Member.nickname}.`, 400);
+        }
 
 
-        // Prepare data for calculation
+        // Prepare data for calculation using DB data for nickname and profession
         const player1Data: PlayerCalculationData = {
-            id: payload.player1.id,
-            nickname: player1Nickname,
-            profession: payload.player1.profession,
+            id: player1Id,
+            nickname: player1Member.nickname,
+            profession: player1Profession, // Use profession from DB
             percentage: payload.player1.percentage
         };
         const player2Data: PlayerCalculationData = {
-            id: payload.player2.id,
-            nickname: player2Nickname,
-            profession: payload.player2.profession,
+            id: player2Id,
+            nickname: player2Member.nickname,
+            profession: player2Profession, // Use profession from DB
             percentage: payload.player2.percentage
         };
 
+        console.log(`Calculating scores for match ${matchId} with DB professions: ${player1Data.nickname} (${player1Data.profession}, ${player1Data.percentage}%) vs ${player2Data.nickname} (${player2Data.profession}, ${player2Data.percentage}%)`);
+
+
         // Perform calculation
+        // Pass player1Data as player and player2Data as opponent for result1
         const result1 = calculateSemifinalScore(player1Data, player2Data);
+        // Pass player2Data as player and player1Data as opponent for result2
         const result2 = calculateSemifinalScore(player2Data, player1Data);
+
+
+        // --- ADD CHECKS HERE ---
+        // Check if calculation returned valid results (totalScore is a number)
+        if (!result1 || typeof result1.totalScore !== 'number' || isNaN(result1.totalScore)) {
+             console.error(`Score calculation failed or returned invalid result for player 1 (${player1Data.nickname}):`, result1);
+             // Include calculation log in the error response for debugging
+             return errorResponse(`Score calculation failed for ${player1Data.nickname}. Check input percentage or calculation logic.`, 500, { log: result1?.log || [] });
+        }
+         if (!result2 || typeof result2.totalScore !== 'number' || isNaN(result2.totalScore)) {
+             console.error(`Score calculation failed or returned invalid result for player 2 (${player2Data.nickname}):`, result2);
+              // Include calculation log in the error response for debugging
+             return errorResponse(`Score calculation failed for ${player2Data.nickname}. Check input percentage or calculation logic.`, 500, { log: result2?.log || [] });
+        }
+        // --- END CHECKS ---
+
 
         // Determine winner
         let winnerPlayerId: number | null = null;
@@ -2915,9 +2958,9 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
         } else if (result2.totalScore > result1.totalScore) {
             winnerPlayerId = result2.id;
         } else {
-            // Handle draw - Player 1 wins on tie for simplicity
+            // Handle draw - Player 1 wins on tie for simplicity (as per previous logic)
              winnerPlayerId = result1.id;
-             console.warn(`Semifinal match ${matchId} resulted in a draw (${result1.totalScore.toFixed(4)} vs ${result2.totalScore.toFixed(4)}). Player 1 (${player1Nickname}) wins tiebreak.`);
+             console.warn(`Semifinal match ${matchId} resulted in a draw (${result1.totalScore.toFixed(4)} vs ${result2.totalScore.toFixed(4)}). Player 1 (${player1Data.nickname}) wins tiebreak.`);
         }
 
 
@@ -2932,7 +2975,7 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
             `UPDATE semifinal_matches
              SET status = ?, winner_player_id = ?,
                  player1_percentage = ?, player2_percentage = ?,
-                 player1_profession = ?, player2_profession = ?,
+                 player1_profession = ?, player2_profession = ?, -- MODIFICATION: Store professions from DB
                  final_score_player1 = ?, final_score_player2 = ?,
                  results_json = ?, updated_at = CURRENT_TIMESTAMP
              WHERE id = ?`
@@ -2940,10 +2983,10 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
         .bind(
             'completed', // Mark as completed
             winnerPlayerId,
-            payload.player1.percentage,
-            payload.player2.percentage,
-            payload.player1.profession,
-            payload.player2.profession,
+            payload.player1.percentage, // Store submitted percentage
+            payload.player2.percentage, // Store submitted percentage
+            player1Profession, // MODIFICATION: Use profession from DB
+            player2Profession, // MODIFICATION: Use profession from DB
             result1.totalScore,
             result2.totalScore,
             JSON.stringify(semifinalResults), // Store results as JSON
@@ -2952,11 +2995,14 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
         .run();
 
         if (!updateResult.success) {
-            console.error("DB update failed:", updateResult.error);
+            console.error(`DB update failed for match ${matchId}:`, updateResult.error);
             return errorResponse('Failed to save match results', 500, updateResult.error);
         }
 
-        // Fetch the updated match to return
+        console.log(`Match ${matchId} updated successfully. Status: completed, Winner: ${winnerPlayerId}`);
+
+
+        // Fetch the updated match to return, including denormalized fields
         const updatedMatch = await env.DB.prepare(
              `SELECT
                 sm.*,
@@ -2983,10 +3029,12 @@ async function handleSubmitSemifinalScores(request: Request, env: Env, matchId: 
         });
 
     } catch (e: any) {
-        console.error("Error submitting semifinal scores:", e);
+        console.error(`Error submitting semifinal scores for match ${matchId} (caught by outer handler):`, e);
+        // Return a generic error message for unexpected exceptions
         return errorResponse('Internal server error submitting scores', 500, e.message);
     }
 }
+
 
 // GET /api/semifinal-matches/:id (Public view of completed match)
 async function handleFetchSemifinalMatch(request: Request, env: Env, matchId: number): Promise<Response> {
